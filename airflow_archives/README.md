@@ -24,12 +24,15 @@ The DAG (`STAMM_Predictions`) performs the following steps every 15 seconds:
 ---
 
 ```mermaid
-graph TD
-    A[Start DAG: STAMM_Predictions<br>⏱ Every 15 seconds] --> B[Check InfluxDB Connection<br>Ensure service is reachable]
-    B --> C[Wait for New Sensor Data<br>Monitor last 15s window]
-    C --> D[Run Predictions<br>Send features to ML models<br>(CART, LSTM, GBM, SVM via REST API)]
-    D --> E[Store Predictions<br>Write results to InfluxDB with timestamp]
-    E --> F[End / Next Cycle]
+
+graph LR
+  A["Start DAG: STAMM_Predictions\n⏱ Every 15 seconds"] --> B["Check InfluxDB Connection\nEnsure service is reachable"]
+  B --> C["Wait for New Sensor Data\nMonitor last 15s window"]
+  C --> D["Run Predictions\nSend features to ML models\n(CART, LSTM, GBM, SVM via REST API)"]
+  D --> E["Store Predictions\nWrite results to InfluxDB with timestamp"]
+  E --> F["End / Next Cycle"]
+
+
 ```
 
 ## Technologies Used
