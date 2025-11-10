@@ -1,0 +1,9 @@
+# --- Python dependencies used by your Airflow image/DAGs ---
+# Pin versions for reproducible builds.
+
+influxdb-client==1.44.0
+python-dotenv==1.0.1
+pandas==2.2.2
+numpy==1.26.4
+requests==2.32.3
+

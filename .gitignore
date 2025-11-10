@@ -1,0 +1,23 @@
+cat > .gitignore << 'EOF'
+# secretos
+.env
+.env.*
+secrets/
+*.token
+*.pem
+*.key
+
+# Airflow
+logs/
+airflow.db
+unittests.cfg
+dags/__pycache__/
+*.pyc
+__pycache__/
+
+# IDE / SO
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+EOF
