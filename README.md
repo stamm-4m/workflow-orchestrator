@@ -1,4 +1,4 @@
-# STAMM — Airflow Orchestrator
+# STAMM - Airflow Orchestrator
 
 A production-ready Airflow stack for orchestrating the **STAMM** workflows.  
 This orchestrator automates the complete data-processing and prediction pipeline by connecting to:
@@ -47,7 +47,7 @@ docker compose version
 
 ## Configuration
 
-### Step 1 — Copy and configure the environment file
+### Step 1 - Copy and configure the environment file
 ```bash
 cp .env.example .env
 ```
@@ -133,26 +133,26 @@ It ensures full automation — from checking system readiness to generating and 
 
 ```text
                  ┌────────────────────────────────┐
-                 │ check_influxdb_connection       │
-                 │ (Verify InfluxDB connectivity)  │
+                 │   check_influxdb_connection    │
+                 │ (Verify InfluxDB connectivity) │
                  └──────────────┬─────────────────┘
                                 │
                                 ▼
                  ┌────────────────────────────────┐
-                 │ check_new_data                  │
-                 │ (Sensor: detect new raw data)   │
+                 │        check_new_data          │
+                 │ (Sensor: detect new raw data)  │
                  └──────────────┬─────────────────┘
                                 │
                                 ▼
                  ┌────────────────────────────────┐
-                 │ run_model_predictions           │
-                 │ (Discover & execute ML models)  │
+                 │     run_model_predictions      │
+                 │ (Discover & execute ML models) │
                  └──────────────┬─────────────────┘
                                 │
                                 ▼
                  ┌────────────────────────────────┐
-                 │ store_predictions               │
-                 │ (Write results to InfluxDB)     │
+                 │      store_predictions         │
+                 │ (Write results to InfluxDB)    │
                  └────────────────────────────────┘
 ```
 
@@ -198,5 +198,30 @@ stamm-airflow/
 | View logs | `docker compose logs -f airflow-webserver` |
 | Rebuild images | `docker compose up -d --build` |
 | Clean all (volumes) | `docker compose down -v` |
+
+---
+
+## Summary
+
+The STAMM Airflow Orchestrator provides a robust and modular framework for automating data-driven prediction pipelines.
+It integrates with InfluxDB for real-time data ingestion and storage, and with a Model Registry for dynamic model discovery and execution.
+
+Key Highlights:
+
+- Full ML lifecycle automation: data detection → model prediction → result storage
+
+- Environment-driven configuration for portability
+
+- Reproducible deployment using Docker Compose
+
+- Clear task flow for monitoring and scaling
+
+This orchestrator enables transparent, scalable, and maintainable industrial AI workflows within the Bioindustry 4.0 ecosystem.
+
+---
+
+### 📬 Contact
+
+For questions, contact Alexander Astudillo at jairo.astudillo-lagos@inrae.fr
 
 ---
