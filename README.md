@@ -131,6 +131,33 @@ It ensures full automation — from checking system readiness to generating and 
 
 ### Simplified DAG Flow
 
+```text
+                 ┌────────────────────────────────┐
+                 │    check_influxdb_connection   │
+                 │          (Health check)        │
+                 └──────────────┬─────────────────┘
+                                │
+                                ▼
+                 ┌────────────────────────────────┐
+                 │         check_new_data         │
+                 │    (snapshot builder + XCom)   │
+                 └──────────────┬─────────────────┘
+                                │
+                                ▼
+                 ┌────────────────────────────────┐
+                 │      run_model_predictions     │
+                 │ (Call models from snapshots) │
+                 └──────────────┬─────────────────┘
+                                │
+                                ▼
+                 ┌────────────────────────────────┐
+                 │       store_predictions        │
+                 │    (Write back to InfluxDB)    │
+                 └────────────────────────────────┘
+```
+
+---
+
 To make the DAG behaviour more concrete, the following example walks through a
 single execution using a batch of bioreactor data already stored in InfluxDB.
 
@@ -287,6 +314,7 @@ Because the predictions share the same device/batch tags and timestamp as the
 underlying raw data, they can be seamlessly joined in dashboards and Flux
 queries, enabling side-by-side visualisation of process variables and
 soft-sensor outputs.
+
 ---
 
 ## File Structure
