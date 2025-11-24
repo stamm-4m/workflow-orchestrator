@@ -10,8 +10,8 @@ This module:
 
 Environment (see your `.env` / `.env.example`):
   # Model Registry (FastAPI)
-  MODEL_REGISTRY_API_BASE=http://model-registry:8000
-  MODEL_REGISTRY_PROJECT_ID=P0001
+  MODEL_REGISTRY_API_BASE=
+  MODEL_REGISTRY_PROJECT_ID=
   MODEL_REGISTRY_TIMEOUT_SECONDS=30
   MODEL_REGISTRY_VERIFY_TLS=true
 
@@ -26,8 +26,6 @@ Environment (see your `.env` / `.env.example`):
   FEATURES=substrate,biomass,dissolved_oxygen,agitator_speed
 
 Notes:
-- LSTM (or any other model family) requires no special handling here.
-  The parser is defensive enough to accommodate small schema differences.
 - The Model Registry must expose:
     GET  /{project_id}/list_models/
     GET  /{project_id}/metadata/{model_id}
@@ -54,10 +52,10 @@ if not log.handlers:
 
 
 # -----------------------------------------------------------------------------
-# Environment-driven configuration
+# Core model registry configuration
 # -----------------------------------------------------------------------------
-MODEL_REGISTRY_API_BASE: str = os.getenv("MODEL_REGISTRY_API_BASE", "http://model-registry:8000")
-MODEL_REGISTRY_PROJECT_ID: str = os.getenv("MODEL_REGISTRY_PROJECT_ID", "P0001")
+MODEL_REGISTRY_API_BASE: str = os.getenv("MODEL_REGISTRY_API_BASE", "")
+MODEL_REGISTRY_PROJECT_ID: str = os.getenv("MODEL_REGISTRY_PROJECT_ID", "")
 MODEL_REGISTRY_TIMEOUT: float = float(os.getenv("MODEL_REGISTRY_TIMEOUT_SECONDS", "30"))
 MODEL_REGISTRY_VERIFY_TLS: bool = os.getenv("MODEL_REGISTRY_VERIFY_TLS", "true").lower() == "true"
 
@@ -95,11 +93,15 @@ def _parse_value_and_version_from_predict(payload: Dict[str, Any]) -> Tuple[Opti
     This function is defensive to accommodate minor schema differences.
     Returns: (prediction_value, version_str or "unknown").
     """
-    # Direct fields (flat)
+
+    # 1) "simple" formats: {"prediction": x}, {"yhat": x}, etc.
     for key in ("prediction", "yhat", "value", "output"):
         if key in payload:
             val = payload[key]
-            pred = _as_scalar(val) if not isinstance(val, (int, float)) else float(val)
+            if isinstance(val, (int, float)):
+                pred = float(val)
+            else:
+                pred = _as_scalar(val)  # intenta sacar un escalar de listas/arrays
             if pred is not None:
                 version = (
                     payload.get("model_version")
@@ -109,14 +111,17 @@ def _parse_value_and_version_from_predict(payload: Dict[str, Any]) -> Tuple[Opti
                 )
                 return pred, str(version)
 
-    # Nested containers
+    # 2) Nested formats: {"data": {"prediction": x}}, {"result": {...}}, etc.
     for nest in ("data", "result", "response"):
         if nest in payload and isinstance(payload[nest], dict):
             nested = payload[nest]
             for key in ("prediction", "yhat", "value", "output"):
                 if key in nested:
                     val = nested[key]
-                    pred = _as_scalar(val) if not isinstance(val, (int, float)) else float(val)
+                    if isinstance(val, (int, float)):
+                        pred = float(val)
+                    else:
+                        pred = _as_scalar(val)
                     if pred is not None:
                         version = (
                             nested.get("model_version")
@@ -126,6 +131,28 @@ def _parse_value_and_version_from_predict(payload: Dict[str, Any]) -> Tuple[Opti
                         )
                         return pred, str(version)
 
+    # 3) Special format for Model Registry:
+
+    if "output_model" in payload and isinstance(payload["output_model"], list) and payload["output_model"]:
+        first = payload["output_model"][0]
+        if isinstance(first, dict) and "prediction" in first:
+            preds = first["prediction"]
+            if isinstance(preds, (list, tuple)) and preds:
+                val = preds[0]
+            else:
+                val = preds
+
+            if isinstance(val, (int, float)):
+                pred = float(val)
+            else:
+                pred = _as_scalar(val)
+
+            if pred is not None:
+                # La versión no viene en este payload, así que dejamos "unknown"
+                # y luego _invoke_model_api llamará a _fetch_version_from_metadata(...)
+                return pred, "unknown"
+
+    # 4) If nothing matches; it returns None, "unknown"
     return None, "unknown"
 
 
@@ -204,7 +231,7 @@ def _discover_models() -> Tuple[Dict[str, str], List[str]]:
                 if isinstance(item, str):
                     model_ids.append(item)
                 elif isinstance(item, dict):
-                    mid = item.get("model_id") or item.get("id") or item.get("name")
+                    mid = item.get("model_ID") or item.get("model_id") or item.get("id") or item.get("name")
                     if isinstance(mid, str):
                         model_ids.append(mid)
 

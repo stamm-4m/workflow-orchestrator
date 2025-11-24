@@ -1,20 +1,21 @@
-version: "3.9"
-
 # ---------------------------------------------------------------------
 # Airflow 3.x — STAMM minimal production-like stack
 # - CeleryExecutor (Redis broker + Postgres result backend)
 # - Custom image (airflow-custom:3.0.6) already contains your deps
 # - .env file mounted and also loaded as env_file
-# - External network to reach InfluxDB/Grafana if needed
+# - Shared network "stamm_net" to reach InfluxDB / Model Registry
 # ---------------------------------------------------------------------
 
 x-airflow-common: &airflow-common
-  image: airflow-custom:3.0.6           
+  image: airflow-custom:3.0.6
   build:
     context: .
     dockerfile: Dockerfile
+
+  # Load all shared environment variables (including Influx / model registry)
   env_file:
     - ./.env
+
   environment: &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
@@ -29,6 +30,9 @@ x-airflow-common: &airflow-common
     AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "False"
     AIRFLOW__CORE__LOAD_EXAMPLES: "False"
 
+    # Execusion API server
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-webserver:8080/execution/"
+
     # Timeouts/parallelism (reasonable defaults)
     AIRFLOW__CORE__PARALLELISM: "8"
     AIRFLOW__CORE__DAG_CONCURRENCY: "8"
@@ -36,23 +40,28 @@ x-airflow-common: &airflow-common
     AIRFLOW__SCHEDULER__MAX_THREADS: "4"
 
     # Logging lightweight defaults
+    
     AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
 
     # Ensure SQLAlchemy 2.0 engine behavior in Airflow 3
     AIRFLOW__DATABASE__LOAD_DEFAULT_CONNECTIONS: "False"
 
-    # Pass through your .env values to tasks (e.g., Influx & model registry)
-    # (You already supply these via env_file ./.env)
+    AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW__API_AUTH__JWT_SECRET}
 
   volumes:
-    # Mount DAGs, logs, plugins; .env as read-only inside container
+    # Mount local directories inside containers
     - ./dags:/opt/airflow/dags
     - ./logs:/opt/airflow/logs
     - ./plugins:/opt/airflow/plugins
+    - ./init:/opt/airflow/init
     - ./.env:/opt/airflow/.env:ro
+
+  # Attach all Airflow core services to:
+  # - airflow_internal: internal network for Postgres / Redis / Flower
+  # - stamm_net: shared network to talk to InfluxDB / Model Registry
   networks:
-    - default
-    - influx_external
+    - airflow_internal
+    - stamm_net
 
   # Backoff & restart policy appropriate for services
   restart: unless-stopped
@@ -61,6 +70,7 @@ x-airflow-common: &airflow-common
 
 services:
 
+  # --------------------------- PostgreSQL ---------------------------
   postgres:
     image: postgres:15
     environment:
@@ -74,8 +84,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - airflow_internal
     restart: unless-stopped
 
+  # --------------------------- Redis Broker --------------------------
   redis:
     image: redis:7
     command: ["redis-server", "--save", "", "--appendonly", "no"]
@@ -84,38 +97,57 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - airflow_internal
     restart: unless-stopped
 
-  # One-shot initialization: creates admin user, upgrades DB, etc.
+  # --------------------------- Airflow Init --------------------------
   airflow-init:
     <<: *airflow-common
-    entrypoint: ["/bin/bash", "-c"]
-    command: >
-      airflow db upgrade &&
-      airflow users create
-        --role Admin
-        --username "$${AIRFLOW_DEFAULT_USER:-admin}"
-        --password "$${AIRFLOW_DEFAULT_PASSWORD:-admin}"
-        --firstname STAMM
-        --lastname Admin
-        --email admin@example.com || true
+    command:
+      - bash
+      - -c
+      - |
+        set -euo pipefail
+
+        echo "[bootstrap] Upgrading Airflow metadata database..."
+        airflow db migrate || airflow db upgrade || true
+
+        AIRFLOW_ADMIN_USER="${AIRFLOW_ADMIN_USER:-airflow}"
+        AIRFLOW_ADMIN_PASSWORD="${AIRFLOW_ADMIN_PASSWORD:-airflow}"
+        AIRFLOW_ADMIN_EMAIL="${AIRFLOW_ADMIN_EMAIL:-admin@stamm.local}"
+
+        echo "[bootstrap] Checking if admin user '${AIRFLOW_ADMIN_USER}' exists..."
+        if airflow users list 2>/dev/null | awk '{print $1}' | grep -qx "${AIRFLOW_ADMIN_USER}"; then
+          echo "[bootstrap] Admin user '${AIRFLOW_ADMIN_USER}' already exists. Skipping creation."
+        else
+          echo "[bootstrap] Creating admin user '${AIRFLOW_ADMIN_USER}'..."
+          airflow users create \
+            --username "${AIRFLOW_ADMIN_USER}" \
+            --password "${AIRFLOW_ADMIN_PASSWORD}" \
+            --firstname "STAMM" \
+            --lastname "Admin" \
+            --role "Admin" \
+            --email "${AIRFLOW_ADMIN_EMAIL}"
+        fi
+
+        echo "[bootstrap] Init completed successfully."
     depends_on:
-      - postgres
-      - redis
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     restart: "no"
 
-  # --------------------------- Airflow services -----------------------
 
+  # --------------------------- Airflow API / UI (Airflow 3) ---------
   airflow-webserver:
     <<: *airflow-common
-    command: ["webserver"]
+    command: ["api-server"]           
     ports:
       - "8080:8080"
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
     depends_on:
       airflow-init:
         condition: service_completed_successfully
@@ -124,6 +156,7 @@ services:
       redis:
         condition: service_healthy
 
+  # --------------------------- Airflow Scheduler ---------------------
   airflow-scheduler:
     <<: *airflow-common
     command: ["scheduler"]
@@ -140,6 +173,7 @@ services:
       redis:
         condition: service_healthy
 
+  # --------------------------- Airflow Triggerer ---------------------
   airflow-triggerer:
     <<: *airflow-common
     command: ["triggerer"]
@@ -156,6 +190,7 @@ services:
       redis:
         condition: service_healthy
 
+  # --------------------------- Airflow Worker ------------------------
   airflow-worker:
     <<: *airflow-common
     command: ["celery", "worker"]
@@ -172,29 +207,33 @@ services:
       redis:
         condition: service_healthy
 
-  airflow-api:
-    <<: *airflow-common
-    command: ["standalone_api"]
-    ports:
-      - "8081:8081"   # Airflow REST API (adjust if needed)
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:8081/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    depends_on:
-      airflow-init:
-        condition: service_completed_successfully
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+  # # --------------------------- Airflow REST API ----------------------
+  # airflow-api:
+  #   <<: *airflow-common
+  #   command: ["apiserver"]
+  #   ports:
+  #     - "8081:8081"
+  #   healthcheck:
+  #     test: ["CMD-SHELL", "curl -f http://localhost:8081/health || exit 1"]
+  #     interval: 30s
+  #     timeout: 10s
+  #     retries: 5
+  #   depends_on:
+  #     airflow-init:
+  #       condition: service_completed_successfully
+  #     postgres:
+  #       condition: service_healthy
+  #     redis:
+  #       condition: service_healthy
 
+# --------------------------- Flower Dashboard ----------------------
   flower:
-    image: mher/flower:2.0.1
+    image: mher/flower:0.9.7
     command: ["flower", "--broker=redis://:@redis:6379/0", "--port=5555"]
     ports:
       - "5555:5555"
+    networks:
+      - airflow_internal
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
       interval: 30s
@@ -204,12 +243,27 @@ services:
       - redis
     restart: unless-stopped
 
+  # --------------------------- Airflow DAG Processor ------------------
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: ["dag-processor"]
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
 # --------------------------- Networks & volumes -----------------------
 
 networks:
-  influx_external:
-    external: true
-    name: influxdb_default  # ensure this external network exists (docker network ls)
+  airflow_internal:
+    driver: bridge
+  stamm_net:
+    name: stamm_net        # Shared network with InfluxDB + Node-RED stacks
+    driver: bridge
 
 volumes:
   postgres-db-volume:

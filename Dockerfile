@@ -1,7 +1,7 @@
 # Build a custom Airflow image with your pinned Python deps preinstalled.
 # This avoids installing pip packages at container start (faster, reproducible).
 
-FROM apache/airflow:2.10.3
+FROM apache/airflow:3.0.6 
 
 # Install system packages only if you really need to compile wheels, etc.
 USER root

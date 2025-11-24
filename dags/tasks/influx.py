@@ -16,7 +16,6 @@ import os
 import json
 import hashlib
 from datetime import datetime, timedelta, timezone
-
 from dotenv import load_dotenv
 from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.operators.python import get_current_context
@@ -40,22 +39,19 @@ load_dotenv(dotenv_path=ENV_PATH)
 # ---------------------------------------------------------------------
 INFLUXDB_URL   = os.getenv("INFLUXDB_URL", "").strip()
 INFLUXDB_TOKEN = os.getenv("INFLUXDB_TOKEN", "").strip()
-INFLUXDB_ORG   = os.getenv("INFLUXDB_ORG", "").strip()
+INFLUXDB_ORG   = os.getenv("INFLUXDB_ORG", "stamm_org").strip()
 
 # Buckets & measurements
 RAW_BUCKET            = os.getenv("RAW_BUCKET", "stamm_raw").strip()
-RAW_MEASUREMENT       = os.getenv("RAW_MEASUREMENT", "bioreactor_obs").strip()
+RAW_MEASUREMENT       = os.getenv("RAW_MEASUREMENT", "device_obs").strip()
 
 PRED_BUCKET           = os.getenv("PREDICTIONS_BUCKET", "stamm_predictions").strip()
-PRED_MEASUREMENT      = os.getenv("PRED_MEASUREMENT", "bioreactor_obs").strip()
+PRED_MEASUREMENT      = os.getenv("PRED_MEASUREMENT", "device_obs").strip()
 PRED_SOURCE           = os.getenv("PRED_SOURCE", "soft_sensor").strip()
 PRED_OBSERVED_PROPERTY= os.getenv("PRED_OBSERVED_PROPERTY", "penicillin_concentration").strip()
 
-# Model service (optional, for upstream calls if needed)
-MODEL_ENDPOINT        = os.getenv("MODEL_ENDPOINT", "").strip()
-
 # Snapshot detection parameters
-LATEST_LOOKBACK     = os.getenv("LATEST_LOOKBACK", "7d").strip()  # Flux duration
+LATEST_LOOKBACK     = os.getenv("LATEST_LOOKBACK", "300s").strip()  # Flux duration
 FRESHNESS_SECONDS   = int(os.getenv("FRESHNESS_SECONDS", "60"))
 TOLERANCE_SECONDS   = int(os.getenv("TOLERANCE_SECONDS", "0"))
 
