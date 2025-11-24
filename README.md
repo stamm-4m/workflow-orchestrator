@@ -146,7 +146,7 @@ It ensures full automation — from checking system readiness to generating and 
                                 ▼
                  ┌────────────────────────────────┐
                  │      run_model_predictions     │
-                 │ (Call models from snapshots) │
+                 │  (Call models from snapshots)  │
                  └──────────────┬─────────────────┘
                                 │
                                 ▼
