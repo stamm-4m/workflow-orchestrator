@@ -48,7 +48,7 @@ RAW_MEASUREMENT       = os.getenv("RAW_MEASUREMENT", "device_obs").strip()
 PRED_BUCKET           = os.getenv("PREDICTIONS_BUCKET", "stamm_predictions").strip()
 PRED_MEASUREMENT      = os.getenv("PRED_MEASUREMENT", "device_obs").strip()
 PRED_SOURCE           = os.getenv("PRED_SOURCE", "soft_sensor").strip()
-PRED_OBSERVED_PROPERTY= os.getenv("PRED_OBSERVED_PROPERTY", "penicillin_concentration").strip()
+PRED_OBSERVED_PROPERTY= os.getenv("PRED_OBSERVED_PROPERTY", "biomass_concentration").strip() #por ahora lo pongo a mano pero se debe poner en el env como variable ya que cambia si hay que hacerlo con penicillin
 
 # Snapshot detection parameters
 LATEST_LOOKBACK     = os.getenv("LATEST_LOOKBACK", "300s").strip()  # Flux duration

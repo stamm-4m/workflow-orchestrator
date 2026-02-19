@@ -210,6 +210,38 @@ def _missing_keys(features: Dict[str, Optional[float]]) -> List[str]:
 # -----------------------------------------------------------------------------
 # Model Registry helpers
 # -----------------------------------------------------------------------------
+def _parse_csv_env(name: str) -> List[str]:
+    raw = os.getenv(name, "").strip()
+    return [x.strip() for x in raw.split(",") if x.strip()] if raw else []
+
+def _select_config_by_project_name(project_name: str) -> Tuple[str, List[str]]:
+    key = (project_name or "").strip().lower()
+
+    if "ecoli" in key:
+        return (
+            os.getenv("MODEL_REGISTRY_PROJECT_ID_ECOLI", "").strip(),
+            _parse_csv_env("FEATURES_ECOLI"),
+        )
+
+    if "penicillin" in key:
+        return (
+            os.getenv("MODEL_REGISTRY_PROJECT_ID_PENICILLIN", "").strip(),
+            _parse_csv_env("FEATURES_PENICILLIN"),
+        )
+
+    # fallback (tu config actual)
+    return (
+        os.getenv("MODEL_REGISTRY_PROJECT_ID", "").strip(),
+        _parse_csv_env("FEATURES"),
+    )
+
+
+
+
+
+
+
+
 def _discover_models() -> Tuple[Dict[str, str], List[str]]:
     """
     Discover available models for the configured project via:
@@ -349,6 +381,31 @@ def call_models_from_snapshots() -> bool:
         if not snapshots:
             log.warning("call_models_from_snapshots: no snapshots found in XCom.")
             return False
+        
+
+        # ------------------------------------------------------------
+        # One-time switch per run (cepas no se mezclan)
+        # ------------------------------------------------------------
+        first = snapshots[0]
+        project_name = first.get("project") or first.get("project_name") or ""
+        pid, feats = _select_config_by_project_name(str(project_name))
+
+        if not pid:
+            log.error(f"No project_id resolved for project_name={project_name}. Check your .env variables.")
+            return False
+        if not feats:
+            log.error(f"No features resolved for project_name={project_name}. Check your .env variables.")
+            return False
+
+        global MODEL_REGISTRY_PROJECT_ID, FEATURES
+        MODEL_REGISTRY_PROJECT_ID = pid
+        FEATURES = feats
+
+        log.info(f"[config switch] project_name={project_name} -> PROJECT_ID={MODEL_REGISTRY_PROJECT_ID} FEATURES={FEATURES}")
+        # ------------------------------------------------------------
+
+
+
 
         # 1) Discover models
         model_id_map, model_list = _discover_models()
