@@ -21,6 +21,8 @@ from airflow.utils.log.logging_mixin import LoggingMixin
 from airflow.operators.python import get_current_context
 from influxdb_client import InfluxDBClient, Point
 from influxdb_client.client.write_api import SYNCHRONOUS
+from typing import Optional
+
 
 # ---------------------------------------------------------------------
 # Logging
@@ -48,7 +50,9 @@ RAW_MEASUREMENT       = os.getenv("RAW_MEASUREMENT", "device_obs").strip()
 PRED_BUCKET           = os.getenv("PREDICTIONS_BUCKET", "stamm_predictions").strip()
 PRED_MEASUREMENT      = os.getenv("PRED_MEASUREMENT", "device_obs").strip()
 PRED_SOURCE           = os.getenv("PRED_SOURCE", "soft_sensor").strip()
-PRED_OBSERVED_PROPERTY= os.getenv("PRED_OBSERVED_PROPERTY", "biomass_concentration").strip() #por ahora lo pongo a mano pero se debe poner en el env como variable ya que cambia si hay que hacerlo con penicillin
+#PRED_OBSERVED_PROPERTY= os.getenv("PRED_OBSERVED_PROPERTY", "biomass_concentration").strip() #por ahora lo pongo a mano pero se debe poner en el env como variable ya que cambia si hay que hacerlo con penicillin
+PRED_OBSERVED_PROPERTY_ECOLI = os.getenv("PRED_OBSERVED_PROPERTY_ECOLI", "biomass_concentration").strip()
+PRED_OBSERVED_PROPERTY_PENICILLIN = os.getenv("PRED_OBSERVED_PROPERTY_PENICILLIN", "penicillin_concentration").strip()
 
 # Snapshot detection parameters
 LATEST_LOOKBACK     = os.getenv("LATEST_LOOKBACK", "300s").strip()  # Flux duration
@@ -113,6 +117,14 @@ def _require_influx_env() -> bool:
         return False
     return True
 
+def _pred_observed_property_for(project_name: Optional[str]) -> str:
+    key = (project_name or "").strip().lower()
+    if "ecoli" in key:
+        return PRED_OBSERVED_PROPERTY_ECOLI or "biomass_concentration"
+    if "penicillin" in key:
+        return PRED_OBSERVED_PROPERTY_PENICILLIN or "penicillin_concentration"
+    # fallback
+    return "biomass_concentration"
 # ---------------------------------------------------------------------
 # 1) Health check
 # ---------------------------------------------------------------------
@@ -308,6 +320,8 @@ def store_prediction() -> bool:
                 snap_time = _to_rfc3339_str(payload.get("snapshot_time"))
                 preds     = payload.get("predictions") or {}
                 tags_src  = payload.get("tags") or {}
+                log.info(f"[{group_id}] tags_src={tags_src}")
+                log.info(f"[{group_id}] project_name(raw)={tags_src.get('project_name')!r} project(raw)={payload.get('project')!r}")
                 versions  = payload.get("model_versions") or {}
 
                 if not snap_time:
@@ -320,6 +334,12 @@ def store_prediction() -> bool:
                 device_id    = tags_src.get("device_id")
                 batch_id     = tags_src.get("batch_id")
                 project_name = tags_src.get("project_name")
+                observed_property = _pred_observed_property_for(project_name)
+                log.info(f"[{group_id}] tags_src={tags_src}")
+                log.info(f"[{group_id}] project_name={project_name!r} -> observed_property={observed_property!r}")
+                log.info(f"[{group_id}] env obs ecoli={PRED_OBSERVED_PROPERTY_ECOLI!r} penicillin={PRED_OBSERVED_PROPERTY_PENICILLIN!r}")
+
+
 
                 for model_key, value in preds.items():
                     if value is None:
@@ -340,7 +360,7 @@ def store_prediction() -> bool:
                     if batch_id     is not None: p = p.tag("batch_id", batch_id)
 
                     p = (p.tag("source", PRED_SOURCE)
-                           .tag("observed_property", PRED_OBSERVED_PROPERTY)
+                           .tag("observed_property", observed_property)
                            .tag("model_id", model_id_tag)
                            .tag("version", version)
                            .field("value", val)
