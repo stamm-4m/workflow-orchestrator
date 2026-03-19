@@ -17,6 +17,9 @@ This repository provides everything required to deploy a **modern, reproducible 
 - Environment-based integration for **InfluxDB** and **Model Registry**
 
 ---
+## Technical Environment
+
+The Airflow orchestrator is based on **Apache Airflow 3.0.6**, running with **Python 3.12.11**.
 
 ## Prerequisites
 
