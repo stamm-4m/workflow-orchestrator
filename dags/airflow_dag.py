@@ -135,8 +135,7 @@ with DAG(
     # -----------------------------------------------------------------
     # 4. Store model predictions back into InfluxDB
     #
-    # - Lee XCom (`predictions`) del task `call_models_from_snapshots`.
-    # - Escribe un punto por (grupo, modelo) en el bucket de predicciones.
+    # - Read XCom (`predictions`) of task `call_models_from_snapshots`.
     # -----------------------------------------------------------------
     store_prediction_task = PythonOperator(
         task_id="store_prediction",
