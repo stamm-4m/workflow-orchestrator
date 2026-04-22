@@ -111,7 +111,7 @@ states. Every DAG in [docs/dags.md](docs/dags.md) is tagged accordingly:
 | **Transitional** | Legacy code still runs, but a refactor against the backend API is planned. |
 | **Planned**   | Not yet implemented; specified in `docs/dags.md`.                   |
 
-One DAG, `stamm_predictions`, is **transitional**: in production today,
+One DAG, `deployment_soft_sensors`, is **transitional**: in production today,
 covering the baseline cycle (health check → snapshot construction →
 prediction → write-back) against InfluxDB directly, with an API-based
 refactor planned.

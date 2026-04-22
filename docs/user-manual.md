@@ -120,7 +120,7 @@ Login with the credentials defined in `.env`.
 
 ## Workflow Overview
 
-The main DAG (`stamm_predictions`) orchestrates the **end-to-end ML prediction cycle** for bioprocess monitoring.  
+The main DAG (`deployment_soft_sensors`) orchestrates the **end-to-end ML prediction cycle** for bioprocess monitoring.  
 It ensures full automation — from checking system readiness to generating and storing model predictions.
 
 | # | Task ID | Description |
@@ -163,7 +163,7 @@ It ensures full automation — from checking system readiness to generating and 
 
 For a worked example (raw InfluxDB points → snapshot JSON → prediction
 JSON → line protocol written back), see
-[`dags.md` §1 *Legacy walkthrough*](./dags.md#legacy-walkthrough).
+[`deployment_soft_sensors.md` *Legacy walkthrough*](./dags/deployment_soft_sensors.md#legacy-walkthrough).
 
 ---
 
@@ -172,15 +172,16 @@ JSON → line protocol written back), see
 ```
 workflow-orchestrator/
 ├─ dags/
-│  ├─ stamm_predictions.py   # Legacy production DAG (see docs/dags.md §1)
+│  ├─ deployment_soft_sensors.py   # Legacy production DAG (see docs/dags/deployment_soft_sensors.md)
 │  ├─ common/                # Shared code reused by every DAG
 │  │  ├─ __init__.py
 │  │  └─ api_client.py       # STAMM backend API client (stub; in development)
-│  └─ tasks/                 # Task modules for stamm_predictions
+│  └─ tasks/                 # Task modules for deployment_soft_sensors
 │     ├─ influx.py
 │     └─ prediction.py
 ├─ docs/
-│  ├─ dags.md                # DAG specification (all current + planned)
+│  ├─ dags.md                # DAG index (all current + planned)
+│  ├─ dags/                  # Per-DAG specification pages
 │  └─ user-manual.md         # This file — day-to-day operation
 ├─ .env.example              # Template; copy to .env and fill in
 ├─ .gitignore
