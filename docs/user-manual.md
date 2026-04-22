@@ -235,10 +235,3 @@ Key Highlights:
 
 This orchestrator enables transparent, scalable, and maintainable industrial AI workflows within the Bioindustry 4.0 ecosystem.
 
----
-
-### 📬 Contact
-
-For questions, contact Alexander Astudillo at jairo.astudillo-lagos@inrae.fr
-
----
