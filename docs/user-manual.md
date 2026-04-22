@@ -1,4 +1,4 @@
-# STAMM - Airflow Orchestrator
+#  Airflow Orchestrator
 
 A production-ready Airflow stack for orchestrating the **STAMM** workflows.  
 This orchestrator automates the complete data-processing and prediction pipeline by connecting to:
@@ -9,7 +9,7 @@ This orchestrator automates the complete data-processing and prediction pipeline
 
 ## Overview
 
-This repository provides everything required to deploy a **modern, reproducible Airflow stack** with **CeleryExecutor**, including:
+This repository provides required to deploy a reproducible Airflow stack with **CeleryExecutor**, including:
 
 - Dockerized services: `airflow-webserver`, `airflow-scheduler`, `airflow-worker`, `postgres`, `redis`
 - Automatic initialization: one-shot `airflow-init` container for database migration and admin creation
