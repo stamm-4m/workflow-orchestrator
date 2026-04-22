@@ -1,20 +1,12 @@
-# STAMM — An Orchestrated ML Platform for Bioprocess Monitoring
+# Airflow as workflow orchestrator for ML soft sensors 
 
-**STAMM** is a workflow orchestration platform for automating the full
-lifecycle of soft-sensor models in industrial bioprocesses. It connects
-real-time sensor streams from fermentation, food manufacturing, and water
-treatment processes to a registry of machine-learning models, runs
-predictions continuously, monitors model drift against laboratory ground
-truth, and orchestrates user-driven or drift-triggered retraining — all
-through a single API-mediated interface.
+The role of Airflow in STAMM is to ensure the lifecycle management of soft-sensor models in industrial processes. It connects real-time sensor streams from fermentation, food manufacturing, and water treatment systems to a registry of machine-learning models, continuously executes predictions, monitors model drift against laboratory ground truth, and orchestrates both user-driven and drift-triggered retraining — all through a unified API-mediated interface.
 
-This repository hosts the orchestration layer of the STAMM stack, built on
-Apache Airflow 3.0.6. It is developed at INRAE within the Bioindustry 4.0
-initiative.
+We are currently using Airflow version 3.0.6.
 
 ---
 
-## Motivation
+## Use case: bioprocess
 
 Industrial bioprocesses generate dense, high-frequency multivariate data
 (pH, dissolved oxygen, temperature, off-gas composition, feed rates) but
@@ -138,12 +130,3 @@ retraining trigger, experiment close, and data quality.
 | [docs/user-manual.md](docs/user-manual.md) | Researchers, bioprocess engineers | Day-to-day operation of STAMM |
 
 ---
-
-## Affiliation and contact
-
-Developed at **INRAE** within the **Bioindustry 4.0** program.
-Contact: Alexander Astudillo — `jairo.astudillo-lagos@inrae.fr`
-
-## Citation
-
-A citation entry will be added once the companion publication is available.
