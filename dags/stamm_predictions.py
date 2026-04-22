@@ -1,5 +1,5 @@
 # =====================================================================
-# STAMM_Predictions DAG
+# stamm_predictions DAG
 # ---------------------------------------------------------------------
 # Description:
 # This DAG orchestrates the end-to-end soft-sensor prediction workflow
@@ -53,7 +53,7 @@ default_args = {
 # DAG Definition
 # ---------------------------------------------------------------------
 with DAG(
-    dag_id="STAMM_DAG",
+    dag_id="stamm_predictions",
     description=(
         "Periodically query new bioreactor data from InfluxDB, execute ML "
         "models via the Model Registry, and store predictions back into InfluxDB."

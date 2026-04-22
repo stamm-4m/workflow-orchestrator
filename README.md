@@ -55,6 +55,41 @@ than a collection of scripts.
 
 ## Architecture
 
+```text
+            ┌──────────────────────────────────────────────────┐
+            │  Bioreactors · sensors · actuators · computed    │   Physical
+            │                      variables                   │
+            └──────────────────────┬───────────────────────────┘
+                                   │ LEAF (edge gateway)
+                                   ▼
+            ┌──────────────────────────────────────────────────┐
+            │   InfluxDB — raw observations & prediction series│   Time-series
+            └──────────────────────┬───────────────────────────┘
+                                   │
+                ┌──────────────────┴──────────────────┐
+                ▼                                     ▼
+    ┌───────────────────────┐           ┌──────────────────────────┐
+    │  PostgreSQL (planned) │           │  Model Registry          │
+    │  experiments, models, │           │  (FastAPI + Streamlit)   │
+    │  drift, retraining,   │           │  discovery · inference · │
+    │  data-quality rows    │           │  versioning              │
+    └──────────┬────────────┘           └────────────┬─────────────┘
+               │                                     │
+               ▼                                     │
+    ┌──────────────────────────┐                     │
+    │  STAMM backend API       │  ◄──────────────────┘   State / API
+    │  (FastAPI, in dev)       │
+    │  unified surface for     │
+    │  DAGs + user tools       │
+    └──────────┬───────────────┘
+               │
+               ▼
+    ┌──────────────────────────┐
+    │  Airflow DAGs            │   Orchestration
+    │  (this repo — see        │
+    │   docs/dags.md)          │
+    └──────────────────────────┘
+```
 
 - **Physical layer.** Sensors, actuators, and computed variables from
   bioreactors stream through LEAF (edge gateway) into the time-series
@@ -75,13 +110,23 @@ than a collection of scripts.
 
 ## Current state and trajectory
 
-One DAG, `STAMM_Predictions`, is in production today. It covers the
-baseline cycle — health check, snapshot construction, prediction,
-write-back — and currently communicates with InfluxDB directly.
+Because STAMM is mid-migration, each component lives in one of three
+states. Every DAG in [docs/dags.md](docs/dags.md) is tagged accordingly:
 
-Active work introduces the PostgreSQL state layer and the backend API,
-and adds five new DAGs: experiment lifecycle, drift detection, retraining
-trigger, experiment close, and data quality..
+| Status        | Meaning                                                             |
+|---------------|---------------------------------------------------------------------|
+| **Legacy**    | Code in production today; reads/writes InfluxDB directly.           |
+| **Transitional** | Legacy code still runs, but a refactor against the backend API is planned. |
+| **Planned**   | Not yet implemented; specified in `docs/dags.md`.                   |
+
+One DAG, `stamm_predictions`, is **transitional**: in production today,
+covering the baseline cycle (health check → snapshot construction →
+prediction → write-back) against InfluxDB directly, with an API-based
+refactor planned.
+
+Active work introduces the **planned** PostgreSQL state layer and the
+backend API, plus five new DAGs: experiment lifecycle, drift detection,
+retraining trigger, experiment close, and data quality.
 
 ---
 
