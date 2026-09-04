@@ -1,9 +1,9 @@
-# --- Python dependencies used by your Airflow image/DAGs ---
-# Pin versions for reproducible builds.
-
-influxdb-client==1.44.0
-python-dotenv==1.0.1
-pandas==2.2.2
-numpy==1.26.4
-requests==2.32.3
-
+# --- Python dependencies used by the DAGs ---
+# psycopg2-binary and the Postgres/common-sql providers aren't listed here:
+# the DAGs talk to model-registry entirely over HTTP (tasks/registry_client.py)
+# and psycopg2-binary already ships in the base apache/airflow image for its
+# own metadata-DB connection, so nothing needs to pull it in again.
+#
+# Unpinned: versions are fixed by the Airflow constraints file applied at
+# build time (see Dockerfile), which matches them to the pinned Airflow core version.
+requests
