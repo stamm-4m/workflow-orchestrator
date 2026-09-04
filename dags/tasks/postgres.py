@@ -9,34 +9,49 @@ works whether Airflow and model-registry sit on the same host or on separate VMs
 Functions exposed to the DAG:
   - check_db_connection():      PythonSensor callable — True when the API is reachable/authenticated
   - wait_for_new_data():        PythonSensor callable — True when there's a sensor reading newer than last_processed_time
-  - build_snapshot():           PythonOperator callable — builds wide snapshot from latest readings
+  - build_snapshot():           PythonOperator callable — builds wide snapshot (+ lag history) from readings
   - store_prediction():         PythonOperator callable — writes predictions via POST /api/v1/predictions/
   - show_prediction_summary():  PythonOperator callable — logs a readable result for the Airflow UI
-  - check_experiment_active():  ShortCircuitOperator callable — True if run is still open.
-                                 Not wired into the current one-shot DAG; kept for when
-                                 the re-trigger loop comes back (see deployment_soft_sensors.py).
+  - trigger_next_cycle():       PythonOperator callable — re-triggers this DAG for the same run_id so
+                                 predictions keep happening for the experiment's whole start_time..end_time
+                                 window, not just once. Stops itself once end_time has passed.
 """
 
 from __future__ import annotations
 
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
+import requests
 from airflow.exceptions import AirflowSkipException
 from airflow.operators.python import get_current_context
 from airflow.utils.log.logging_mixin import LoggingMixin
 
 from tasks import registry_client
-from tasks.prediction import _select_config_by_project_name
+from tasks.prediction import (
+    _select_config_by_project_name,
+    _model_interval_seconds,
+    _fetch_models_catalog,
+)
 
 log = LoggingMixin().log
 
+# Airflow 3.0 workers have no direct DB/ORM access (isolated task execution
+# — see AIRFLOW__CORE__EXECUTION_API_SERVER_URL / the "Task Execution
+# Interface"), so trigger_next_cycle re-triggers this DAG the same way an
+# external caller would: over Airflow's own REST API, self-referentially.
+AIRFLOW_SELF_API_BASE = os.getenv("AIRFLOW_SELF_API_BASE", "http://airflow-webserver:8080")
+AIRFLOW_ADMIN_USER = os.getenv("AIRFLOW_ADMIN_USER", "")
+AIRFLOW_ADMIN_PASSWORD = os.getenv("AIRFLOW_ADMIN_PASSWORD", "")
+
 # XCom keys / task IDs
 XCOM_SNAPSHOTS_KEY   = "snapshots"
+XCOM_HISTORY_KEY     = "history"
 XCOM_SNAPSHOT_TIME   = "snapshot_time"
 XCOM_PREDICTIONS_KEY = "predictions"
 MODEL_TASK_ID        = "call_models_from_snapshots"
+DAG_ID               = "deployment_soft_sensors"
 
 # How stale can the latest reading be (seconds) before we ignore it
 FRESHNESS_SECONDS = int(os.getenv("FRESHNESS_SECONDS", "120"))
@@ -63,11 +78,12 @@ def _since(conf: dict, lookback_seconds: Optional[int] = None) -> str:
     a lookback window" instead, matching the freshness threshold: nothing
     older than that would pass build_snapshot's freshness check anyway.
 
-    lookback_seconds should be the model's own cadence (see
-    _model_freshness_seconds) — a model that only samples every 12 minutes
+    lookback_seconds should cover the shortest cadence among the models
+    attached to this run (see _min_freshness_seconds) plus however far back
+    any of them needs lagged history — a model sampling every 12 minutes
     needs a lookback of more than a couple minutes or the first trigger will
     never see it as "new data". Falls back to FRESHNESS_SECONDS if the
-    caller doesn't know the model yet.
+    caller doesn't know the models yet.
     """
     explicit = conf.get("last_processed_time")
     if explicit:
@@ -102,60 +118,44 @@ def _experiment_end_time(experiment_id: str) -> Optional[datetime]:
         return None
 
 
-def _model_freshness_seconds(project_id: str, model_id: str) -> int:
-    """How old a reading is allowed to be, derived from the official model's
-    declared input_time_interval (e.g. "one measurement every 12 minutes")
-    instead of a single hardcoded value for every model/project.
-
-    Applies a 1.5x margin over the declared interval to tolerate normal
-    jitter (a sensor reporting a few seconds late shouldn't be treated as
-    "the bioreactor stopped sending data"). Falls back to FRESHNESS_SECONDS
-    if the metadata is missing or malformed.
-    """
-    unit_seconds = {
-        "second": 1, "seconds": 1, "sec": 1,
-        "minute": 60, "minutes": 60, "min": 60,
-        "hour": 3600, "hours": 3600, "hr": 3600,
-        "day": 86400, "days": 86400,
-    }
-    try:
-        resp = registry_client.get(f"/{project_id}/metadata/{model_id}")
-        if resp.status_code != 200:
-            raise ValueError(f"metadata HTTP {resp.status_code}")
-        interval = (
-            resp.json()
-            .get("model_description", {})
-            .get("input_time_interval", {})
-            .get("time_interval", {})
-        )
-        value = float(interval["value"])
-        unit = unit_seconds[str(interval["unit"]).strip().lower()]
-        return int(value * unit * 1.5)
-    except Exception as exc:
-        log.warning(
-            f"_model_freshness_seconds: could not read input_time_interval for "
-            f"{project_id}/{model_id} ({exc}) — falling back to FRESHNESS_SECONDS={FRESHNESS_SECONDS}"
-        )
+def _min_freshness_seconds(model_ids: List[str], catalog: Dict[str, dict]) -> int:
+    """How old a reading is allowed to be, derived from the SHORTEST declared
+    input_time_interval across every model attached to this run — with
+    several models at different cadences, the most demanding one sets the
+    pace so none of them go stale. 1.5x margin over the interval tolerates
+    normal jitter. Falls back to FRESHNESS_SECONDS if nothing resolves."""
+    intervals = [
+        secs for mid in model_ids
+        if (row := catalog.get(mid)) and (secs := _model_interval_seconds(row))
+    ]
+    if not intervals:
         return FRESHNESS_SECONDS
+    return int(min(intervals) * 1.5)
 
 
-def _soft_sensor_map(project_id: str) -> Dict[str, str]:
-    """model_id (extracted from path_metadata) -> soft_sensor_id, for one project."""
-    links = registry_client.get_all_pages("/api/v1/project_soft_sensors/")
-    soft_sensors = {s["id"]: s for s in registry_client.get_all_pages("/api/v1/soft_sensors/")}
-
-    ss_map: Dict[str, str] = {}
-    for link in links:
-        if link.get("project_id") != project_id:
+def _max_lag_seconds(model_ids: List[str], catalog: Dict[str, dict]) -> int:
+    """Largest lag*interval declared across every attached model's features —
+    how far back build_snapshot needs to fetch raw readings to satisfy any
+    lagged feature. 0 if nothing uses lag (the common case today)."""
+    max_needed = 0
+    for mid in model_ids:
+        row = catalog.get(mid)
+        if not row:
             continue
-        ss = soft_sensors.get(link.get("soft_sensor_id"))
-        if not ss:
-            continue
-        path = ss.get("path_metadata") or ""
-        if "/models/" in path:
-            model_id_in_path = path.split("/models/")[1].split("/")[0]
-            ss_map[model_id_in_path] = ss["id"]
-    return ss_map
+        interval_s = _model_interval_seconds(row) or 0
+        for feat in (row.get("inputs") or {}).get("features", []) or []:
+            lag = feat.get("lag") or 0
+            if lag and interval_s:
+                max_needed = max(max_needed, int(lag) * interval_s)
+    return max_needed
+
+
+def _model_row_ids() -> Dict[str, str]:
+    """models.slug -> models.id. predictions.model_id is a UUID FK to
+    models.id, but the model_key we get back from call_models_from_snapshots
+    is the human-readable slug (e.g. "0001_python_penicillin_RF"), so this
+    resolves one to the other before writing a prediction."""
+    return {slug: row["id"] for slug, row in _fetch_models_catalog().items()}
 
 
 # ---------------------------------------------------------------------------
@@ -196,13 +196,6 @@ def wait_for_new_data() -> bool:
     conf = _conf(ctx)
     run_id = conf["run_id"]
 
-    _, _, official_model_id = _select_config_by_project_name(conf.get("project_name", ""))
-    lookback = (
-        _model_freshness_seconds(conf.get("project_id", ""), official_model_id)
-        if official_model_id else None
-    )
-    since = _since(conf, lookback)
-
     experiment_id = conf.get("experiment_id")
     if experiment_id:
         end_time = _experiment_end_time(experiment_id)
@@ -211,6 +204,13 @@ def wait_for_new_data() -> bool:
                 f"[{run_id}] experiment {experiment_id} ended at {end_time.isoformat()} "
                 f"— no longer waiting for data."
             )
+
+    _, model_ids = _select_config_by_project_name(conf.get("project_name", ""), conf)
+    lookback = None
+    if model_ids:
+        catalog = _fetch_models_catalog()
+        lookback = _min_freshness_seconds(model_ids, catalog) + _max_lag_seconds(model_ids, catalog)
+    since = _since(conf, lookback)
 
     resp = registry_client.get(f"/api/v1/runs/{run_id}/sensor_readings", params={"since": since, "limit": 1})
     if resp.status_code != 200:
@@ -223,7 +223,7 @@ def wait_for_new_data() -> bool:
 
 
 # ---------------------------------------------------------------------------
-# 3) Build wide snapshot from latest sensor + actuator readings
+# 3) Build wide snapshot (+ lag history) from sensor + actuator readings
 # ---------------------------------------------------------------------------
 
 def build_snapshot() -> None:
@@ -235,15 +235,20 @@ def build_snapshot() -> None:
       - experiment_id       (UUID of the parent experiment)
       - project_id          (UUID of the project)
       - project_name        (str, used to select model registry project)
+      - model_ids           (list[str], models.slug — every model attached to the experiment)
       - last_processed_time (ISO timestamp; empty on first trigger)
 
     Fetches sensor_readings/actuator_states since last_processed_time via the
-    Model Registry API, builds a "wide" snapshot dict keyed by variable name,
-    and pushes it to XCom.
+    Model Registry API, builds a "wide" snapshot dict keyed by variable name
+    (the latest value per variable), plus a raw history list wide enough to
+    cover any lagged feature any attached model declares, and pushes both to
+    XCom.
 
     XCom out:
-      key "snapshots"      → list[ {run_id, project_name, <variable>: value, ...} ]
-      key "snapshot_time"  → ISO timestamp of the snapshot (used by re_trigger)
+      key "snapshots"     → list[ {run_id, project_name, <variable>: value, ...} ]
+      key "history"       → list[ {time, variable, value} ] — only populated when
+                             at least one attached model declares lag > 0
+      key "snapshot_time" → ISO timestamp of the snapshot (used by trigger_next_cycle)
     """
     ctx = get_current_context()
     ti  = ctx["ti"]
@@ -254,15 +259,16 @@ def build_snapshot() -> None:
     project_id         = conf["project_id"]
     project_name       = conf.get("project_name", "")
 
-    # Freshness/lookback threshold comes from the official model's declared
-    # input_time_interval (e.g. "one measurement every 12 minutes") — not a
+    # Freshness/lookback threshold comes from the SHORTEST declared
+    # input_time_interval across every model attached to this run — not a
     # single hardcoded value for every model, since different models expect
-    # different sampling cadences.
-    _, _, official_model_id = _select_config_by_project_name(project_name)
-    freshness_seconds = (
-        _model_freshness_seconds(project_id, official_model_id) if official_model_id else FRESHNESS_SECONDS
-    )
-    since = _since(conf, freshness_seconds)
+    # different sampling cadences. The lookback window is widened further
+    # when any attached model needs lagged (historical) features.
+    _, model_ids = _select_config_by_project_name(project_name, conf)
+    catalog = _fetch_models_catalog() if model_ids else {}
+    freshness_seconds = _min_freshness_seconds(model_ids, catalog) if model_ids else FRESHNESS_SECONDS
+    max_lag_seconds = _max_lag_seconds(model_ids, catalog) if model_ids else 0
+    since = _since(conf, freshness_seconds + max_lag_seconds)
 
     sensor_resp = registry_client.get(f"/api/v1/runs/{run_id}/sensor_readings", params={"since": since, "limit": 5000})
     sensor_resp.raise_for_status()
@@ -281,7 +287,7 @@ def build_snapshot() -> None:
     if age_s > freshness_seconds:
         raise ValueError(
             f"build_snapshot: latest reading is {age_s:.0f}s old "
-            f"(threshold={freshness_seconds}s, from model input_time_interval). "
+            f"(threshold={freshness_seconds}s, from models' input_time_interval). "
             f"Is the bioreactor still sending data?"
         )
 
@@ -305,7 +311,7 @@ def build_snapshot() -> None:
         if var not in latest_actuator_by_var or r["time"] > latest_actuator_by_var[var]["time"]:
             latest_actuator_by_var[var] = r
 
-    # Build the wide dict
+    # Build the wide dict (lag=0 view — "current" value per variable)
     snapshot: Dict[str, Any] = {
         "group_id":      run_id,          # keeps prediction.py compatible
         "run_id":        run_id,
@@ -321,13 +327,28 @@ def build_snapshot() -> None:
     for var, row in latest_actuator_by_var.items():
         snapshot.setdefault(var, row["value"])  # sensor wins on collision
 
+    # Raw history — only worth building when some attached model actually
+    # needs lagged features; otherwise it would just duplicate `snapshot`.
+    history: List[Dict[str, Any]] = []
+    if max_lag_seconds:
+        for r in sensor_readings:
+            var = sensor_var.get(r["sensor_id"])
+            if var:
+                history.append({"time": r["time"], "variable": var, "value": r["value"]})
+        for r in actuator_readings:
+            var = actuator_var.get(r["actuator_id"])
+            if var:
+                history.append({"time": r["time"], "variable": var, "value": r["value"]})
+
     ti.xcom_push(key=XCOM_SNAPSHOTS_KEY, value=[snapshot])
-    ti.xcom_push(key=XCOM_SNAPSHOT_TIME,  value=snapshot_time_str)
+    ti.xcom_push(key=XCOM_HISTORY_KEY,   value=history)
+    ti.xcom_push(key=XCOM_SNAPSHOT_TIME, value=snapshot_time_str)
 
     log.info(
         f"[{run_id}] snapshot built at {snapshot_time_str} "
-        f"— {len(latest_sensor_rows)} sensor(s), {len(latest_actuator_by_var)} actuator(s) "
-        f"— fields: {[k for k in snapshot if k not in ('group_id','run_id','experiment_id','project_id','project_name','snapshot_time')]}"
+        f"— {len(latest_sensor_rows)} sensor(s), {len(latest_actuator_by_var)} actuator(s), "
+        f"{len(history)} history row(s) — "
+        f"fields: {[k for k in snapshot if k not in ('group_id','run_id','experiment_id','project_id','project_name','snapshot_time')]}"
     )
 
 
@@ -340,11 +361,12 @@ def store_prediction() -> None:
     PythonOperator callable.
 
     Reads XCom predictions from call_models_from_snapshots and POSTs one row
-    per (run_id, soft_sensor_id, time) to /api/v1/predictions/.
+    per (run_id, model_id, time) to /api/v1/predictions/ — one row per model
+    attached to the experiment, since call_models_from_snapshots now runs
+    every one of them, not just a single "official" model.
 
-    soft_sensor_id is resolved by matching the model_key returned by the
-    Model Registry against the path_metadata column of soft_sensors:
-        "projects/<proj>/models/<model_id>/metadata.yaml"
+    model_id is resolved by matching the model_key (models.slug) returned by
+    the Model Registry against the models catalog (see _model_row_ids()).
     """
     ctx  = get_current_context()
     ti   = ctx["ti"]
@@ -360,7 +382,7 @@ def store_prediction() -> None:
 
     wrote = 0
     summary: list[Dict[str, Any]] = []
-    ss_map_cache: Dict[str, Dict[str, str]] = {}
+    model_ids = _model_row_ids()
 
     for group_id, payload in predictions_by_group.items():
         if not isinstance(payload, dict):
@@ -380,10 +402,6 @@ def store_prediction() -> None:
             log.warning(f"[{group_id}] no project_id available → skip.")
             continue
 
-        if project_id not in ss_map_cache:
-            ss_map_cache[project_id] = _soft_sensor_map(project_id)
-        ss_map = ss_map_cache[project_id]
-
         for model_key, value in preds.items():
             if value is None:
                 log.warning(f"[{run_id}] {model_key}: None value → skip.")
@@ -394,24 +412,17 @@ def store_prediction() -> None:
                 log.warning(f"[{run_id}] {model_key}: cannot cast {value!r} to float → skip.")
                 continue
 
-            # Exact match first, then substring fallback
-            soft_sensor_id: Optional[str] = ss_map.get(model_key)
-            if not soft_sensor_id:
-                for path_key, ss_id in ss_map.items():
-                    if model_key in path_key or path_key in model_key:
-                        soft_sensor_id = ss_id
-                        break
-
-            if not soft_sensor_id:
+            model_row_id: Optional[str] = model_ids.get(model_key)
+            if not model_row_id:
                 log.warning(
-                    f"[{run_id}] no soft_sensor_id for model_key={model_key!r}. "
-                    f"Available: {list(ss_map.keys())}"
+                    f"[{run_id}] no models row for slug={model_key!r}. "
+                    f"Available: {list(model_ids.keys())}"
                 )
                 continue
 
             resp = registry_client.post(
                 "/api/v1/predictions/",
-                json_body={"time": snap_time, "run_id": run_id, "soft_sensor_id": soft_sensor_id, "value": val},
+                json_body={"time": snap_time, "run_id": run_id, "model_id": model_row_id, "value": val},
             )
             if resp.status_code == 201:
                 wrote += 1
@@ -460,41 +471,91 @@ def show_prediction_summary() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 6) Check if the experiment is still active (used by ShortCircuitOperator)
+# 6) Keep predicting for the experiment's whole duration
 # ---------------------------------------------------------------------------
 
-def check_experiment_active(**context) -> bool:
+def _airflow_self_token() -> Optional[str]:
+    if not AIRFLOW_ADMIN_USER or not AIRFLOW_ADMIN_PASSWORD:
+        log.error("trigger_next_cycle: AIRFLOW_ADMIN_USER/AIRFLOW_ADMIN_PASSWORD not set — cannot self-trigger.")
+        return None
+    try:
+        resp = requests.post(
+            f"{AIRFLOW_SELF_API_BASE}/auth/token",
+            json={"username": AIRFLOW_ADMIN_USER, "password": AIRFLOW_ADMIN_PASSWORD},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return resp.json()["access_token"]
+    except Exception as exc:
+        log.error(f"trigger_next_cycle: failed to obtain a self-token: {exc}")
+        return None
+
+
+def trigger_next_cycle() -> None:
     """
-    ShortCircuitOperator callable.
+    PythonOperator callable. Last task in the chain.
 
-    Returns True  → experiment still running, re-trigger the DAG.
-    Returns False → experiment ended, stop the chain quietly.
+    Re-triggers this same DAG for the same run_id so the next batch of
+    sensor data (per the fastest attached model's own cadence) gets its own
+    prediction cycle — this is what keeps an experiment created for e.g. 2
+    hours predicting for the full 2 hours instead of stopping after one shot.
+
+    Airflow 3.0 workers have no direct DB access (see AIRFLOW_SELF_API_BASE
+    above), so this goes over Airflow's own REST API — the same endpoint
+    model-registry itself calls to start the first cycle.
+
+    Uses a fresh run_id derived from the ORIGINAL run_id + a timestamp (never
+    from dag_run.run_id) so it can't grow unboundedly across cycles like the
+    old re-trigger design did. Passes last_processed_time forward so the next
+    cycle only looks for data newer than what this cycle already used.
+
+    Stops the chain (does nothing) once the experiment's end_time has passed
+    — wait_for_new_data's AirflowSkipException already stops most chains
+    earlier than this; this is the same check for the case where a full
+    cycle completes right as end_time is reached.
     """
-    run_id = context["dag_run"].conf.get("run_id")
-    if not run_id:
-        log.warning("check_experiment_active: no run_id in conf.")
-        return False
+    ctx = get_current_context()
+    ti = ctx["ti"]
+    conf = _conf(ctx)
+    run_id = conf["run_id"]
+    experiment_id = conf.get("experiment_id")
 
-    run_resp = registry_client.get(f"/api/v1/runs/{run_id}")
-    if run_resp.status_code != 200:
-        log.warning(f"check_experiment_active: could not fetch run {run_id}: HTTP {run_resp.status_code}")
-        return False
-    run = run_resp.json()
+    if experiment_id:
+        end_time = _experiment_end_time(experiment_id)
+        if end_time and datetime.now(timezone.utc) > end_time:
+            log.info(f"[{run_id}] experiment {experiment_id} ended at {end_time.isoformat()} — not re-triggering.")
+            return
 
-    if run.get("end_time"):
-        log.info(f"[{run_id}] run has ended — stopping DAG chain.")
-        return False
+    token = _airflow_self_token()
+    if not token:
+        return
 
-    experiment_id = run.get("experiment_id")
-    exp_resp = registry_client.get(f"/api/v1/experiments/{experiment_id}")
-    if exp_resp.status_code != 200:
-        log.warning(f"check_experiment_active: could not fetch experiment {experiment_id}: HTTP {exp_resp.status_code}")
-        return False
-    experiment = exp_resp.json()
+    snapshot_time = ti.xcom_pull(task_ids="build_snapshot", key=XCOM_SNAPSHOT_TIME)
+    next_conf = dict(conf)
+    if snapshot_time:
+        # The Model Registry API's `since` filter is inclusive (time >= since)
+        # — passing the snapshot's own timestamp back unchanged would make the
+        # next cycle immediately "find" that exact same reading again and
+        # spin through empty cycles until genuinely new data arrives. Nudge
+        # forward by 1us so the next cycle only matches readings strictly
+        # after this one.
+        try:
+            dt = datetime.fromisoformat(str(snapshot_time).replace("Z", "+00:00"))
+            next_conf["last_processed_time"] = (dt + timedelta(microseconds=1)).isoformat()
+        except ValueError:
+            next_conf["last_processed_time"] = snapshot_time
 
-    active = experiment.get("status") == "running"
-    if active:
-        log.info(f"[{run_id}] experiment still active — will re-trigger.")
-    else:
-        log.info(f"[{run_id}] experiment ended (status={experiment.get('status')}) — stopping DAG chain.")
-    return active
+    next_run_id = f"cycle__{run_id}__{int(datetime.now(timezone.utc).timestamp())}"
+    try:
+        resp = requests.post(
+            f"{AIRFLOW_SELF_API_BASE}/api/v2/dags/{DAG_ID}/dagRuns",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"logical_date": None, "conf": next_conf, "dag_run_id": next_run_id},
+            timeout=10,
+        )
+        if resp.status_code not in (200, 201):
+            log.error(f"[{run_id}] failed to trigger next cycle: HTTP {resp.status_code} {resp.text}")
+            return
+        log.info(f"[{run_id}] triggered next cycle: {next_run_id} (since={next_conf.get('last_processed_time')})")
+    except Exception as exc:
+        log.error(f"[{run_id}] error triggering next cycle: {exc}")

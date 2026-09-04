@@ -2,14 +2,17 @@
 STAMM — prediction caller for Airflow DAGs.
 
 This module:
-  1) Pulls a feature snapshot from XCom (produced by build_snapshot).
-  2) Discovers the models registered for the project (GET /{project_id}/list_models/)
-     and picks out the single "official" one configured for that project.
-  3) Invokes POST /{project_id}/predict/{model_id} for that model.
-  4) Pushes the result back to XCom (prediction value + model version).
-
-Which model is "official" is a per-project, per-team decision, not something
-this module infers — see _select_config_by_project_name().
+  1) Pulls a feature snapshot (+ short history, for lagged features) from
+     XCom (produced by build_snapshot).
+  2) Runs a prediction for EVERY model attached to the experiment — model-
+     registry sends their models.slug list as conf["model_ids"] when it
+     triggers the DAG (one per model selected in the experiment's dropdown).
+  3) For each model, builds its own feature vector from its own declared
+     `inputs.features` (name + lag + type), fetched from the models catalog
+     (GET /api/v1/models/) — no more hardcoded per-project feature lists.
+  4) Invokes POST /{project_id}/predict/{model_id} for each model.
+  5) Pushes the results back to XCom (prediction value + model version, per
+     model).
 
 Environment (see workflow-orchestrator/.env):
   # Model Registry (FastAPI)
@@ -22,8 +25,8 @@ Environment (see workflow-orchestrator/.env):
   # Per-project config: <PROJECT> is ECOLI, PENICILLIN, ... (see
   # _select_config_by_project_name for how project_name maps to these)
   MODEL_REGISTRY_PROJECT_ID_<PROJECT>=
-  FEATURES_<PROJECT>=                # comma-separated, in the order the model was trained with
-  MODEL_ID_<PROJECT>=                # the one model this module will call for that project
+  FEATURES_<PROJECT>=                # fallback only, for models with no inputs.features metadata yet
+  MODEL_ID_<PROJECT>=                # fallback only, used when a trigger doesn't send conf["model_ids"]
 
   # XCom / task wiring (optional, defaults shown)
   SENSOR_TASK_ID=build_snapshot
@@ -32,8 +35,7 @@ Environment (see workflow-orchestrator/.env):
 
 Notes:
 - The Model Registry must expose:
-    GET  /{project_id}/list_models/
-    GET  /{project_id}/metadata/{model_id}
+    GET  /api/v1/models/
     POST /{project_id}/predict/{model_id}
 """
 
@@ -41,6 +43,7 @@ from __future__ import annotations
 
 import os
 import logging
+from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from airflow.operators.python import get_current_context
@@ -60,7 +63,6 @@ if not log.handlers:
 # Core model registry configuration
 # -----------------------------------------------------------------------------
 MODEL_REGISTRY_API_BASE: str = os.getenv("MODEL_REGISTRY_API_BASE", "")
-MODEL_REGISTRY_PROJECT_ID: str = os.getenv("MODEL_REGISTRY_PROJECT_ID", "")
 MODEL_REGISTRY_TIMEOUT: float = float(os.getenv("MODEL_REGISTRY_TIMEOUT_SECONDS", "30"))
 MODEL_REGISTRY_VERIFY_TLS: bool = os.getenv("MODEL_REGISTRY_VERIFY_TLS", "true").lower() == "true"
 
@@ -69,10 +71,15 @@ MODEL_REGISTRY_SERVICE_PASSWORD: str = os.getenv("MODEL_REGISTRY_SERVICE_PASSWOR
 
 SENSOR_TASK_ID: str = os.getenv("SENSOR_TASK_ID", "check_new_data")
 XCOM_SNAPSHOTS_KEY: str = os.getenv("XCOM_SNAPSHOTS_KEY", "snapshots")
+XCOM_HISTORY_KEY: str = os.getenv("XCOM_HISTORY_KEY", "history")
 XCOM_PREDICTIONS_KEY: str = os.getenv("XCOM_PREDICTIONS_KEY", "predictions")
 
-_FEATURES_FROM_ENV = os.getenv("FEATURES", "").strip()
-FEATURES: List[str] = [f.strip() for f in _FEATURES_FROM_ENV.split(",") if f.strip()] if _FEATURES_FROM_ENV else []
+_UNIT_SECONDS = {
+    "second": 1, "seconds": 1, "sec": 1,
+    "minute": 60, "minutes": 60, "min": 60,
+    "hour": 3600, "hours": 3600, "hr": 3600,
+    "day": 86400, "days": 86400,
+}
 
 
 # -----------------------------------------------------------------------------
@@ -156,63 +163,96 @@ def _parse_value_and_version_from_predict(payload: Dict[str, Any]) -> Tuple[Opti
                 pred = _as_scalar(val)
 
             if pred is not None:
-                # Version isn't in this payload; _invoke_model_api() falls back
-                # to _fetch_version_from_metadata() when it sees "unknown".
                 return pred, "unknown"
 
     # 4) If nothing matches; it returns None, "unknown"
     return None, "unknown"
 
 
-def _extract_features(snapshot: Dict[str, Any], required: List[str]) -> Dict[str, Optional[float]]:
+def _model_interval_seconds(model_row: Dict[str, Any]) -> Optional[int]:
+    """Raw sampling interval (no margin) declared in models.input_time_interval."""
+    try:
+        interval = (model_row.get("input_time_interval") or {}).get("time_interval") or {}
+        value = float(interval["value"])
+        unit = _UNIT_SECONDS[str(interval["unit"]).strip().lower()]
+        return int(value * unit)
+    except Exception:
+        return None
+
+
+def _model_features(model_row: Dict[str, Any], project_env_key: str) -> List[Dict[str, Any]]:
+    """Feature spec list (name/lag/type) for one model, from models.inputs.
+    Falls back to the flat FEATURES_<PROJECT> env var (all lag=0) for models
+    that don't have inputs.features populated yet (older/partial registry rows).
     """
-    Build the model input features from the snapshot.
-    Priority:
-      1) If `required` is provided: take only those keys (from snapshot or snapshot["features"])
-      2) Else if snapshot has `features` dict: use it
-      3) Else: infer numeric fields from top-level snapshot
+    feats = ((model_row.get("inputs") or {}).get("features")) or []
+    if feats:
+        return feats
+    fallback = _parse_csv_env(f"FEATURES_{project_env_key}") or _parse_csv_env("FEATURES")
+    return [{"name": name, "lag": 0} for name in fallback]
+
+
+def _extract_features_for_model(
+    model_row: Dict[str, Any],
+    snapshot: Dict[str, Any],
+    history: List[Dict[str, Any]],
+    snapshot_time: datetime,
+    project_env_key: str,
+) -> Tuple[Dict[str, Optional[float]], List[str]]:
+    """Build one model's input vector from the shared snapshot/history,
+    honoring each feature's declared lag (0 = current value, N = N sampling
+    intervals back — see models.inputs.features[].lag).
+
+    Returns (features, missing_required) — missing_required lists any
+    feature the model needs that couldn't be resolved.
     """
+    interval_s = _model_interval_seconds(model_row)
     features: Dict[str, Optional[float]] = {}
+    missing: List[str] = []
 
-    # 1) Explicit list from env
-    if required:
-        source = snapshot.get("features") if isinstance(snapshot.get("features"), dict) else snapshot
-        for k in required:
-            v = source.get(k)
-            if isinstance(v, (int, float)):
-                features[k] = float(v)
-            else:
-                features[k] = _as_scalar(v)
-        return features
-
-    # 2) Provided "features" dict
-    if isinstance(snapshot.get("features"), dict):
-        for k, v in snapshot["features"].items():
-            if isinstance(v, (int, float)):
-                features[k] = float(v)
-            else:
-                features[k] = _as_scalar(v)
-        return features
-
-    # 3) Infer from top-level numeric fields
-    for k, v in snapshot.items():
-        if k in {"group_id", "snapshot_time", "device_id", "batch_id", "project", "project_name"}:
+    for feat in _model_features(model_row, project_env_key):
+        name = feat.get("name")
+        if not name:
             continue
-        if isinstance(v, (int, float)):
-            features[k] = float(v)
+        lag = int(feat.get("lag") or 0)
+
+        if lag == 0:
+            val = _as_scalar(snapshot.get(name))
+        elif interval_s:
+            target = snapshot_time - timedelta(seconds=lag * interval_s)
+            val = _closest_history_value(history, name, target)
         else:
-            val = _as_scalar(v)
-            if val is not None:
-                features[k] = val
+            val = None
 
-    return features
+        features[name] = val
+        if val is None:
+            missing.append(f"{name}(lag={lag})")
+
+    return features, missing
 
 
-def _missing_keys(features: Dict[str, Optional[float]]) -> List[str]:
-    """Return required keys that are missing or None (only when FEATURES is set)."""
-    if not FEATURES:
-        return []
-    return [k for k in FEATURES if k not in features or features[k] is None]
+def _closest_history_value(
+    history: List[Dict[str, Any]], variable: str, target: datetime, tolerance_s: float = 120.0
+) -> Optional[float]:
+    """Closest reading for `variable` at-or-before `target`, within tolerance."""
+    best_val = None
+    best_delta = None
+    for row in history:
+        if row.get("variable") != variable:
+            continue
+        try:
+            t = datetime.fromisoformat(str(row["time"]).replace("Z", "+00:00"))
+        except Exception:
+            continue
+        if t > target:
+            continue
+        delta = (target - t).total_seconds()
+        if delta > tolerance_s:
+            continue
+        if best_delta is None or delta < best_delta:
+            best_delta = delta
+            best_val = row.get("value")
+    return _as_scalar(best_val)
 
 
 # -----------------------------------------------------------------------------
@@ -223,96 +263,51 @@ def _parse_csv_env(name: str) -> List[str]:
     raw = os.getenv(name, "").strip()
     return [x.strip() for x in raw.split(",") if x.strip()] if raw else []
 
-def _select_config_by_project_name(project_name: str) -> Tuple[str, List[str], str]:
-    """Return (project_id, features, official_model_id) for the project.
 
-    official_model_id is the single model call_models_from_snapshots() will
-    invoke — not "whichever models happen to be registered". Which model is
-    official is a product decision (pending a team call on which to use);
-    for now it's pinned per project via MODEL_ID_<PROJECT> env vars.
-    """
+def _project_env_key(project_name: str) -> str:
     key = (project_name or "").strip().lower()
-
     if "ecoli" in key:
-        return (
-            os.getenv("MODEL_REGISTRY_PROJECT_ID_ECOLI", "").strip(),
-            _parse_csv_env("FEATURES_ECOLI"),
-            os.getenv("MODEL_ID_ECOLI", "").strip(),
-        )
-
+        return "ECOLI"
     if "penicillin" in key:
-        return (
-            os.getenv("MODEL_REGISTRY_PROJECT_ID_PENICILLIN", "").strip(),
-            _parse_csv_env("FEATURES_PENICILLIN"),
-            os.getenv("MODEL_ID_PENICILLIN", "").strip(),
-        )
+        return "PENICILLIN"
+    return ""
 
-    # Fallback for a single-project deployment (no per-project env suffix).
-    return (
-        os.getenv("MODEL_REGISTRY_PROJECT_ID", "").strip(),
-        _parse_csv_env("FEATURES"),
-        os.getenv("MODEL_ID", "").strip(),
-    )
 
-def _discover_models() -> Tuple[Dict[str, str], List[str]]:
+def _select_config_by_project_name(project_name: str, conf: Optional[dict] = None) -> Tuple[str, List[str]]:
+    """Return (project_id, model_ids) for the project.
+
+    model_ids are the models.slug of every model attached to the experiment
+    that triggered this DAG — model-registry resolves this per-experiment
+    (models the user selected in the experiment's dropdown) and sends it as
+    conf["model_ids"]. Falls back to a single-item list from MODEL_ID_<PROJECT>
+    env vars only for triggers that don't specify one (e.g. manual runs).
     """
-    Discover available models for the configured project via:
-        GET /{project_id}/list_models/
-    Expected responses:
-      - list[str] (model IDs)
-      - list[object] including 'model_id' or 'id' or 'name'
-    Returns (MODEL_ID_MAP, MODEL_LIST) where keys are equal to model IDs.
-    """
-    path = f"/{MODEL_REGISTRY_PROJECT_ID}/list_models/"
+    env_key = _project_env_key(project_name)
+    conf_model_ids = [m for m in ((conf or {}).get("model_ids") or []) if m]
+
+    if env_key:
+        project_id = os.getenv(f"MODEL_REGISTRY_PROJECT_ID_{env_key}", "").strip()
+        fallback = os.getenv(f"MODEL_ID_{env_key}", "").strip()
+    else:
+        project_id = os.getenv("MODEL_REGISTRY_PROJECT_ID", "").strip()
+        fallback = os.getenv("MODEL_ID", "").strip()
+
+    model_ids = conf_model_ids or ([fallback] if fallback else [])
+    return project_id, model_ids
+
+
+def _fetch_models_catalog() -> Dict[str, Dict[str, Any]]:
+    """models.slug -> full models row (id, inputs, input_time_interval,
+    version, ...). Small catalog, fetched in full."""
     try:
-        resp = registry_client.get(path)
-        resp.raise_for_status()
-        payload = resp.json()
-
-        model_ids: List[str] = []
-        if isinstance(payload, list):
-            for item in payload:
-                if isinstance(item, str):
-                    model_ids.append(item)
-                elif isinstance(item, dict):
-                    mid = item.get("model_ID") or item.get("model_id") or item.get("id") or item.get("name")
-                    if isinstance(mid, str):
-                        model_ids.append(mid)
-
-        model_map = {mid: mid for mid in model_ids}  # logical key == model_id
-        return model_map, model_ids
-
+        rows = registry_client.get_all_pages("/api/v1/models/")
+        return {r["slug"]: r for r in rows if r.get("slug")}
     except Exception as exc:
-        log.error(f"[discovery] Unable to list models from API ({path}): {exc}")
-        return {}, []
+        log.error(f"Unable to fetch models catalog: {exc}")
+        return {}
 
 
-def _fetch_version_from_metadata(api_model_id: str) -> str:
-    """
-    Retrieve version info as a fallback:
-      GET /{project_id}/metadata/{model_id}
-    Tries to read `model_identification.version`.
-    """
-    path = f"/{MODEL_REGISTRY_PROJECT_ID}/metadata/{api_model_id}"
-    try:
-        r = registry_client.get(path)
-        if r.status_code != 200:
-            log.warning(f"[metadata:{api_model_id}] HTTP {r.status_code}: {r.text}")
-            return "unknown"
-        meta = r.json()
-        ident = meta.get("model_identification") or {}
-        ver = _as_scalar(ident.get("version")) or ident.get("version")
-        return str(ver) if ver is not None else "unknown"
-    except Exception as exc:
-        log.warning(f"[metadata:{api_model_id}] error: {exc}")
-        return "unknown"
-
-
-def _invoke_model_api(
-    model_key: str,
-    features: Dict[str, Optional[float]],
-    model_id_map: Dict[str, str],
-) -> Tuple[Optional[float], str]:
+def _invoke_model_api(project_id: str, model_slug: str, features: Dict[str, Optional[float]]) -> Tuple[Optional[float], str]:
     """
     Invoke:
       POST /{project_id}/predict/{model_id}
@@ -321,30 +316,21 @@ def _invoke_model_api(
     Returns:
       (prediction_value, version_str)
     """
-    api_model_id = model_id_map.get(model_key)
-    if not api_model_id:
-        log.error(f"No model_id for '{model_key}' in discovered catalog.")
-        return None, "unknown"
-
-    path = f"/{MODEL_REGISTRY_PROJECT_ID}/predict/{api_model_id}"
+    path = f"/{project_id}/predict/{model_slug}"
     payload = {"req": {"input_data": features}}
 
     try:
         r = registry_client.post(path, json_body=payload)
         if r.status_code != 200:
-            log.error(f"[{model_key}] HTTP {r.status_code} @ {path}: {r.text}")
+            log.error(f"[{model_slug}] HTTP {r.status_code} @ {path}: {r.text}")
             return None, "unknown"
 
         data = r.json()
-
         yhat, version = _parse_value_and_version_from_predict(data)
-        if version == "unknown":
-            version = _fetch_version_from_metadata(api_model_id)
-
         return yhat, version
 
     except Exception as exc:
-        log.error(f"[{model_key}] error invoking API @ {path}: {exc}")
+        log.error(f"[{model_slug}] error invoking API @ {path}: {exc}")
         return None, "unknown"
 
 
@@ -354,13 +340,16 @@ def _invoke_model_api(
 def call_models_from_snapshots() -> bool:
     """
     Airflow task:
-      1) Pull snapshots from XCom (pushed by build_snapshot)
-      2) Resolve the project's official model (see _select_config_by_project_name)
-      3) For each snapshot, extract features and invoke that one model
+      1) Pull the snapshot (+ history) from XCom (pushed by build_snapshot)
+      2) Resolve every model attached to this experiment (see
+         _select_config_by_project_name)
+      3) For each model, extract its own feature vector (lag-aware) and
+         invoke it
       4) Push a consolidated result back to XCom
 
     XCom input:
       key = XCOM_SNAPSHOTS_KEY (default: "snapshots")
+      key = XCOM_HISTORY_KEY (default: "history"), optional
       task_ids = SENSOR_TASK_ID (default: "build_snapshot")
 
     XCom output:
@@ -369,110 +358,91 @@ def call_models_from_snapshots() -> bool:
         "<group_id>": {
           "snapshot_time": "<iso>",
           "tags": {...},
-          "features": {...},
-          "predictions": {"<model_key>": <float or None>, ...},
-          "model_versions": {"<model_key>": "<version|unknown>", ...}
+          "predictions": {"<model_slug>": <float or None>, ...},
+          "model_versions": {"<model_slug>": "<version|unknown>", ...}
         }, ...
       }
     """
     try:
         ctx = get_current_context()
         ti = ctx["ti"]
+        conf = ctx["dag_run"].conf or {}
 
         snapshots: List[Dict[str, Any]] = ti.xcom_pull(
             key=XCOM_SNAPSHOTS_KEY,
             task_ids=SENSOR_TASK_ID,
         )
+        history: List[Dict[str, Any]] = ti.xcom_pull(
+            key=XCOM_HISTORY_KEY,
+            task_ids=SENSOR_TASK_ID,
+        ) or []
 
         if not snapshots:
             log.warning("call_models_from_snapshots: no snapshots found in XCom.")
             return False
 
         # ------------------------------------------------------------
-        # Resolve project config once per run, from the first snapshot's
-        # project_name. A run is always scoped to one project, so this
-        # never needs to change mid-loop.
+        # Resolve project + attached models once per run, from the first
+        # snapshot's project_name. A run is always scoped to one project.
         # ------------------------------------------------------------
         first = snapshots[0]
         project_name = first.get("project") or first.get("project_name") or ""
-        pid, feats, official_model_id = _select_config_by_project_name(str(project_name))
+        project_id, model_ids = _select_config_by_project_name(str(project_name), conf)
+        env_key = _project_env_key(str(project_name))
 
-        if not pid:
+        if not project_id:
             log.error(f"No project_id resolved for project_name={project_name}. Check your .env variables.")
             return False
-        if not feats:
-            log.error(f"No features resolved for project_name={project_name}. Check your .env variables.")
-            return False
-        if not official_model_id:
+        if not model_ids:
             log.error(
-                f"No official model configured for project_name={project_name}. "
-                f"Set MODEL_ID_ECOLI / MODEL_ID_PENICILLIN / MODEL_ID in .env."
+                f"No models attached to this experiment for project_name={project_name}, and no "
+                f"MODEL_ID_{env_key or ''} fallback set. Nothing to predict."
             )
             return False
 
-        global MODEL_REGISTRY_PROJECT_ID, FEATURES
-        MODEL_REGISTRY_PROJECT_ID = pid
-        FEATURES = feats
-
-        log.info(f"[config switch] project_name={project_name} -> PROJECT_ID={MODEL_REGISTRY_PROJECT_ID} FEATURES={FEATURES}")
-        # ------------------------------------------------------------
-
-        # 1) Discover models, then pin down to the one official model.
-        # Calling every registered model isn't the product intent -- which
-        # model is "the" soft sensor per project is a pending team decision;
-        # for now exactly one gets invoked (MODEL_ID_* in .env).
-        model_id_map, discovered = _discover_models()
-        if official_model_id not in model_id_map:
-            log.error(
-                f"Configured official model '{official_model_id}' not found in discovered "
-                f"catalog for project {MODEL_REGISTRY_PROJECT_ID}. Available: {discovered}"
-            )
-            return False
-        model_list = [official_model_id]
-
-        log.info(
-            f"Processing {len(snapshots)} snapshot(s). "
-            f"API_BASE={MODEL_REGISTRY_API_BASE} PROJECT={MODEL_REGISTRY_PROJECT_ID} "
-            f"MODEL={official_model_id}"
-        )
+        catalog = _fetch_models_catalog()
+        log.info(f"Processing {len(snapshots)} snapshot(s). API_BASE={MODEL_REGISTRY_API_BASE} PROJECT={project_id} MODELS={model_ids}")
 
         results: Dict[str, Dict[str, Any]] = {}
 
         for snap in snapshots:
             group_id: str = str(snap.get("group_id", "unknown"))
-            snapshot_time: str = str(snap.get("snapshot_time", ""))
+            snapshot_time_str: str = str(snap.get("snapshot_time", ""))
+            try:
+                snapshot_time = datetime.fromisoformat(snapshot_time_str.replace("Z", "+00:00"))
+            except Exception:
+                snapshot_time = datetime.utcnow()
 
             tags = {
                 "project_name":  snap.get("project") or snap.get("project_name"),
-                # PostgreSQL-backed fields (new)
                 "run_id":        snap.get("run_id"),
                 "experiment_id": snap.get("experiment_id"),
                 "project_id":    snap.get("project_id"),
-                # InfluxDB-backed fields (legacy, kept for backwards compat)
-                "device_id": snap.get("device_id"),
-                "batch_id":  snap.get("batch_id"),
             }
 
-            # 2) Build the features vector
-            feat = _extract_features(snap, FEATURES)
-            missing = _missing_keys(feat)
-            if missing:
-                log.warning(f"[{group_id}] missing required features in snapshot {snapshot_time}: {missing} → skip")
-                continue
-
-            # 3) Invoke the official model (model_list has exactly one entry)
             preds: Dict[str, Optional[float]] = {}
             vers: Dict[str, str] = {}
 
-            for model_key in model_list:
-                yhat, ver = _invoke_model_api(model_key, feat, model_id_map)
-                preds[model_key] = yhat
-                vers[model_key] = ver
+            for model_slug in model_ids:
+                model_row = catalog.get(model_slug)
+                if not model_row:
+                    log.error(f"[{group_id}] model '{model_slug}' not found in models catalog for project {project_id} — skip.")
+                    preds[model_slug] = None
+                    vers[model_slug] = "unknown"
+                    continue
+
+                feat, missing = _extract_features_for_model(model_row, snap, history, snapshot_time, env_key)
+                if missing:
+                    log.warning(f"[{group_id}] {model_slug}: missing required features in snapshot {snapshot_time_str}: {missing} → skip")
+                    continue
+
+                yhat, ver = _invoke_model_api(project_id, model_slug, feat)
+                preds[model_slug] = yhat
+                vers[model_slug] = ver or model_row.get("version") or "unknown"
 
             results[group_id] = {
-                "snapshot_time": snapshot_time,
+                "snapshot_time": snapshot_time_str,
                 "tags": tags,
-                "features": feat,
                 "predictions": preds,
                 "model_versions": vers,
             }
@@ -482,7 +452,6 @@ def call_models_from_snapshots() -> bool:
             log.warning("No predictions generated (incomplete snapshots or API errors).")
             return False
 
-        # 4) Publish consolidated predictions to XCom
         ti.xcom_push(key=XCOM_PREDICTIONS_KEY, value=results)
         log.info(f"Predictions published to XCom key='{XCOM_PREDICTIONS_KEY}'. Groups: {list(results.keys())}")
         return True

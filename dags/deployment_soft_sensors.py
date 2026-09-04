@@ -13,35 +13,36 @@
 #   the following conf payload:
 #
 #     {
-#       "run_id":             "<uuid>",   -- active run to monitor
+#       "run_id":             "<uuid>",     -- active run to monitor
 #       "experiment_id":      "<uuid>",
 #       "project_id":         "<uuid>",
-#       "project_name":       "<str>",    -- used to pick model registry project
-#       "last_processed_time":"<iso>",    -- omit on first trigger
-#       "user_id":            "<uuid>"    -- optional, for audit
+#       "project_name":       "<str>",      -- used to pick model registry project
+#       "model_ids":          ["<slug>"],   -- models.slug of every model attached
+#                                               to the experiment; every one gets a
+#                                               prediction each cycle
+#       "vessel_id":          "<uuid>",     -- bioreactor this experiment runs on (optional)
+#       "last_processed_time":"<iso>",      -- omit on first trigger
+#       "user_id":            "<uuid>"      -- optional, for audit
 #     }
 #
-# Flow per trigger:
+# Flow per cycle:
 #   1. check_db_connection      — PythonSensor: verifies the Model Registry API
 #                                 is reachable and the service account is valid
 #   2. wait_for_new_data        — PythonSensor: blocks (reschedule mode) until
 #                                 GET /api/v1/runs/{run_id}/sensor_readings
 #                                 returns rows newer than last_processed_time
 #   3. build_snapshot           — Pivots latest sensor + actuator readings into
-#                                 a "wide" feature dict; pushes to XCom
-#   4. call_models              — Calls the project's one official model
+#                                 a "wide" feature dict (+ lag history); pushes to XCom
+#   4. call_models               — Calls every model attached to the experiment
 #                                 (see tasks/prediction.py) via the Model Registry API
 #   5. store_prediction         — POSTs predictions to /api/v1/predictions/
 #   6. show_prediction_summary  — Logs a readable result for the Airflow UI
-#
-# NOTE (one-shot, temporary): this used to end with check_experiment_active
-# (ShortCircuitOperator) + re_trigger (TriggerDagRunOperator) so it kept
-# polling and predicting in a loop for as long as the experiment stayed
-# "running". Turned off for now because the Dash has no way to end/pause an
-# experiment yet, so the loop never stopped on its own. One DAG run now
-# produces exactly one prediction per model and finishes. Re-enable the loop
-# (see git history / tasks/postgres.py:check_experiment_active, still there
-# unused) once the Dash can mark an experiment as ended.
+#   7. trigger_next_cycle       — Re-triggers this DAG for the same run_id, with
+#                                 last_processed_time advanced, so predictions keep
+#                                 happening for the experiment's whole start..end
+#                                 window. Stops itself (no-op) once end_time has
+#                                 passed — wait_for_new_data also stops the chain
+#                                 early via AirflowSkipException in that case.
 # =====================================================================
 
 from datetime import timedelta
@@ -56,6 +57,7 @@ from tasks.postgres import (
     check_db_connection,
     show_prediction_summary,
     store_prediction,
+    trigger_next_cycle,
     wait_for_new_data,
 )
 from tasks.prediction import call_models_from_snapshots
@@ -79,21 +81,24 @@ with DAG(
     dag_id="deployment_soft_sensors",
     description=(
         "Event-driven soft-sensor pipeline: triggered on experiment creation, "
-        "polls the Model Registry API for new bioreactor readings, calls the "
-        "prediction endpoints, writes predictions back via the API. Currently "
-        "one-shot (no re-trigger loop) — see NOTE at top of this file."
+        "polls the Model Registry API for new bioreactor readings, calls every "
+        "model attached to the experiment, writes predictions back via the API, "
+        "and re-triggers itself for the next batch of data until the "
+        "experiment's end_time passes."
     ),
     default_args=default_args,
-    schedule=None,                       # triggered externally only
+    schedule=None,                       # triggered externally / by itself only
     start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
     catchup=False,
-    max_active_runs=10,                  # one concurrent run per experiment
+    max_active_runs=10,                  # one concurrent cycle per experiment
     is_paused_upon_creation=True,
     params={                             # document expected conf keys
         "run_id": "",
         "experiment_id": "",
         "project_id": "",
         "project_name": "",
+        "model_ids": [],
+        "vessel_id": "",
         "last_processed_time": "",
         "user_id": "",
     },
@@ -121,7 +126,8 @@ with DAG(
     # 2. Wait for new sensor readings
     #
     # Polls GET /api/v1/runs/{run_id}/sensor_readings?since=last_processed_time
-    # and succeeds as soon as it returns at least one row.
+    # and succeeds as soon as it returns at least one row. Gives up early
+    # (skips the rest of the DAG) once the experiment's end_time has passed.
     #
     # In reschedule mode the worker slot is released between pokes.
     # Timeout is 24 h — long enough for overnight experiments.
@@ -136,13 +142,16 @@ with DAG(
         #### Task: Wait for New Sensor Data
         Polls `GET /api/v1/runs/{run_id}/sensor_readings` for rows newer than
         `last_processed_time`. Fires when the bioreactor starts sending data.
+        Skips the rest of the DAG once the experiment has ended.
         """,
     )
 
     # -----------------------------------------------------------------
-    # 3. Build wide snapshot
+    # 3. Build wide snapshot (+ lag history)
     #    Pivots the latest sensor + actuator readings into a flat dict
-    #    keyed by variable name, pushed to XCom key "snapshots".
+    #    keyed by variable name, pushed to XCom key "snapshots". Also
+    #    fetches a wider window of raw readings when an attached model
+    #    declares lagged features, pushed to XCom key "history".
     # -----------------------------------------------------------------
     build_snapshot_task = PythonOperator(
         task_id="build_snapshot",
@@ -155,24 +164,24 @@ with DAG(
     )
 
     # -----------------------------------------------------------------
-    # 4. Run model prediction
-    #    Resolves the project's one official model (MODEL_ID_* in .env) and
-    #    invokes POST /{project_id}/predict/{model_id} for it.
+    # 4. Run model predictions
+    #    Runs every model attached to the experiment (conf["model_ids"]),
+    #    each with its own feature list and lag handling, and invokes
+    #    POST /{project_id}/predict/{model_id} for each one.
     # -----------------------------------------------------------------
     call_model_task = PythonOperator(
         task_id="call_models_from_snapshots",
         python_callable=call_models_from_snapshots,
         doc_md="""
-        #### Task: Run Model Prediction
-        Confirms the project's official model is registered (GET
-        /{project_id}/list_models/) and calls POST /{project_id}/predict/{model_id}
-        for it. Result is pushed to XCom key "predictions".
+        #### Task: Run Model Predictions
+        Calls POST /{project_id}/predict/{model_id} once per model attached
+        to the experiment. Results are pushed to XCom key "predictions".
         """,
     )
 
     # -----------------------------------------------------------------
     # 5. Store predictions via the Model Registry API
-    #    POSTs to /api/v1/predictions/ (time, run_id, soft_sensor_id, value).
+    #    POSTs to /api/v1/predictions/ (time, run_id, model_id, value).
     # -----------------------------------------------------------------
     store_prediction_task = PythonOperator(
         task_id="store_prediction",
@@ -180,7 +189,7 @@ with DAG(
         doc_md="""
         #### Task: Store Predictions
         POSTs each model prediction to /api/v1/predictions/, matching
-        the model_key to soft_sensor_id via project_soft_sensors.
+        the model_key (models.slug) to models.id via the models catalog.
         """,
     )
 
@@ -200,8 +209,23 @@ with DAG(
     )
 
     # -----------------------------------------------------------------
-    # Task sequence — one-shot: stops after showing the result.
-    # See the NOTE at the top of this file for why re_trigger is off.
+    # 7. Keep predicting until the experiment ends
+    #    Re-triggers this DAG for the same run_id with last_processed_time
+    #    advanced. No-ops once the experiment's end_time has passed.
+    # -----------------------------------------------------------------
+    trigger_next_cycle_task = PythonOperator(
+        task_id="trigger_next_cycle",
+        python_callable=trigger_next_cycle,
+        doc_md="""
+        #### Task: Trigger Next Cycle
+        Re-triggers deployment_soft_sensors for the same run_id so the next
+        batch of sensor data gets its own prediction cycle, until the
+        experiment's end_time passes.
+        """,
+    )
+
+    # -----------------------------------------------------------------
+    # Task sequence — one cycle, then re-triggers itself for the next one.
     # -----------------------------------------------------------------
     (
         check_db_task
@@ -210,4 +234,5 @@ with DAG(
         >> call_model_task
         >> store_prediction_task
         >> show_result_task
+        >> trigger_next_cycle_task
     )

@@ -41,11 +41,24 @@ Content-Type: application/json
     "run_id": "<uuid of the run to monitor>",
     "experiment_id": "<uuid of the experiment>",
     "project_id": "<uuid of the project>",
-    "project_name": "<project name, used to pick FEATURES_* / MODEL_REGISTRY_PROJECT_ID_* / MODEL_ID_*>",
+    "project_name": "<project name, used to pick MODEL_REGISTRY_PROJECT_ID_*>",
+    "model_ids": ["<models.slug>", "..."],
+    "vessel_id": "<uuid of the bioreactor this experiment runs on, optional>",
     "user_id": "<uuid, optional, for audit>"
   }
 }
 ```
+
+`model_ids` is the `slug` (not the `models.id` UUID) of **every** model
+attached to the experiment — resolve each one from `experiment_models` →
+`models.slug`. Airflow runs a prediction for each model in the list on every
+cycle. If omitted, Airflow falls back to a single-item list from its own
+`MODEL_ID_<PROJECT>` env var — only meant for triggers that don't have any
+model attached yet, not the normal path.
+
+`vessel_id` is `experiments.vessel_id` — the bioreactor the experiment runs
+on. Airflow doesn't use it for anything today (sensors aren't scoped per
+piece of equipment yet), it's passed through purely for provenance/audit.
 
 `logical_date: null` is required by the API even though this DAG has
 `schedule=None` and ignores it — Airflow still wants the field present.
@@ -62,16 +75,18 @@ model-registry side for correlation, but not required for anything.
 
 The DAG waits for the first sensor reading on that `run_id` (up to 24h, or
 until the experiment's `end_time` passes, whichever comes first — see
-`experiments.end_time`), then builds a feature snapshot, calls the
-project's official model, and stores the prediction.
+`experiments.end_time`), then builds a feature snapshot, calls every model in
+`model_ids`, and stores one prediction per model. It then re-triggers itself
+for the same `run_id` (with `last_processed_time` advanced to this cycle's
+snapshot) and repeats — so an experiment created for e.g. 2 hours keeps
+producing predictions for the full 2 hours, not just once. The chain stops
+itself once `experiments.end_time` passes; you only need to trigger it the
+one time, right after the run is created.
 
-**This is currently one-shot**: each trigger produces exactly one
-prediction and the DAG run ends there — it does not loop or re-trigger
-itself. That's a deliberate, temporary simplification (the Dash has no way
-to end/pause an experiment yet, so an auto-looping DAG had no way to know
-when to stop). If you want a prediction on every new batch of sensor data
-for a long-running experiment, trigger the DAG again yourself for the same
-`run_id` — the `conf` schema is identical.
+Each attached model can have its own sampling cadence
+(`models.input_time_interval`) — the DAG uses the **shortest** one across
+`model_ids` to decide how often to check for new data, so no model goes
+stale waiting on a slower one.
 
 ## Read predictions back
 
