@@ -143,7 +143,12 @@ def _max_lag_seconds(model_ids: List[str], catalog: Dict[str, dict]) -> int:
         if not row:
             continue
         interval_s = _model_interval_seconds(row) or 0
-        for feat in (row.get("inputs") or {}).get("features", []) or []:
+        # Some models declare inputs as a plain list of feature names (no
+        # lag/type metadata at all) instead of the richer {"features": [...]}
+        # shape — nothing to look at for lag in that case.
+        inputs = row.get("inputs")
+        features = inputs.get("features") if isinstance(inputs, dict) else None
+        for feat in features or []:
             lag = feat.get("lag") or 0
             if lag and interval_s:
                 max_needed = max(max_needed, int(lag) * interval_s)
@@ -151,10 +156,11 @@ def _max_lag_seconds(model_ids: List[str], catalog: Dict[str, dict]) -> int:
 
 
 def _model_row_ids() -> Dict[str, str]:
-    """models.slug -> models.id. predictions.model_id is a UUID FK to
-    models.id, but the model_key we get back from call_models_from_snapshots
-    is the human-readable slug (e.g. "0001_python_penicillin_RF"), so this
-    resolves one to the other before writing a prediction."""
+    """soft_sensors.slug -> soft_sensors.id. predictions.soft_sensor_id is a
+    UUID FK to soft_sensors.id, but the model_key we get back from
+    call_models_from_snapshots is the human-readable slug (e.g.
+    "0001_python_penicillin_RF"), so this resolves one to the other before
+    writing a prediction."""
     return {slug: row["id"] for slug, row in _fetch_models_catalog().items()}
 
 
@@ -361,12 +367,13 @@ def store_prediction() -> None:
     PythonOperator callable.
 
     Reads XCom predictions from call_models_from_snapshots and POSTs one row
-    per (run_id, model_id, time) to /api/v1/predictions/ — one row per model
-    attached to the experiment, since call_models_from_snapshots now runs
-    every one of them, not just a single "official" model.
+    per (run_id, soft_sensor_id, time) to /api/v1/predictions/ — one row per
+    model attached to the experiment, since call_models_from_snapshots now
+    runs every one of them, not just a single "official" model.
 
-    model_id is resolved by matching the model_key (models.slug) returned by
-    the Model Registry against the models catalog (see _model_row_ids()).
+    soft_sensor_id is resolved by matching the model_key (soft_sensors.slug)
+    returned by the Model Registry against the models catalog (see
+    _model_row_ids()).
     """
     ctx  = get_current_context()
     ti   = ctx["ti"]
@@ -422,7 +429,7 @@ def store_prediction() -> None:
 
             resp = registry_client.post(
                 "/api/v1/predictions/",
-                json_body={"time": snap_time, "run_id": run_id, "model_id": model_row_id, "value": val},
+                json_body={"time": snap_time, "run_id": run_id, "soft_sensor_id": model_row_id, "value": val},
             )
             if resp.status_code == 201:
                 wrote += 1

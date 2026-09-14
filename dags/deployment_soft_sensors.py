@@ -181,7 +181,7 @@ with DAG(
 
     # -----------------------------------------------------------------
     # 5. Store predictions via the Model Registry API
-    #    POSTs to /api/v1/predictions/ (time, run_id, model_id, value).
+    #    POSTs to /api/v1/predictions/ (time, run_id, soft_sensor_id, value).
     # -----------------------------------------------------------------
     store_prediction_task = PythonOperator(
         task_id="store_prediction",

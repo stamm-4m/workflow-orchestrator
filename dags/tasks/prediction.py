@@ -9,7 +9,7 @@ This module:
      triggers the DAG (one per model selected in the experiment's dropdown).
   3) For each model, builds its own feature vector from its own declared
      `inputs.features` (name + lag + type), fetched from the models catalog
-     (GET /api/v1/models/) — no more hardcoded per-project feature lists.
+     (GET /api/v1/soft_sensors/) — no more hardcoded per-project feature lists.
   4) Invokes POST /{project_id}/predict/{model_id} for each model.
   5) Pushes the results back to XCom (prediction value + model version, per
      model).
@@ -35,7 +35,7 @@ Environment (see workflow-orchestrator/.env):
 
 Notes:
 - The Model Registry must expose:
-    GET  /api/v1/models/
+    GET  /api/v1/soft_sensors/
     POST /{project_id}/predict/{model_id}
 """
 
@@ -182,12 +182,22 @@ def _model_interval_seconds(model_row: Dict[str, Any]) -> Optional[int]:
 
 def _model_features(model_row: Dict[str, Any], project_env_key: str) -> List[Dict[str, Any]]:
     """Feature spec list (name/lag/type) for one model, from models.inputs.
+
+    inputs comes in two shapes in the wild:
+      - {"features": [{"name": ..., "lag": ..., "type": ...}, ...]} — rich,
+        used by the penicillin/ecoli models this pipeline was built against.
+      - ["DO", "pH", "T", ...] — a plain list of feature names, no lag/type
+        metadata at all (several of the simpler seeded models).
     Falls back to the flat FEATURES_<PROJECT> env var (all lag=0) for models
-    that don't have inputs.features populated yet (older/partial registry rows).
+    that have neither populated yet (older/partial registry rows).
     """
-    feats = ((model_row.get("inputs") or {}).get("features")) or []
-    if feats:
-        return feats
+    inputs = model_row.get("inputs")
+    if isinstance(inputs, dict):
+        feats = inputs.get("features") or []
+        if feats:
+            return feats
+    elif isinstance(inputs, list) and inputs:
+        return [{"name": name, "lag": 0} for name in inputs if isinstance(name, str)]
     fallback = _parse_csv_env(f"FEATURES_{project_env_key}") or _parse_csv_env("FEATURES")
     return [{"name": name, "lag": 0} for name in fallback]
 
@@ -297,10 +307,11 @@ def _select_config_by_project_name(project_name: str, conf: Optional[dict] = Non
 
 
 def _fetch_models_catalog() -> Dict[str, Dict[str, Any]]:
-    """models.slug -> full models row (id, inputs, input_time_interval,
-    version, ...). Small catalog, fetched in full."""
+    """soft_sensors.slug -> full soft_sensors row (id, inputs,
+    input_time_interval, version, ...). Small catalog, fetched in full.
+    (Table was renamed models -> soft_sensors on the registry side.)"""
     try:
-        rows = registry_client.get_all_pages("/api/v1/models/")
+        rows = registry_client.get_all_pages("/api/v1/soft_sensors/")
         return {r["slug"]: r for r in rows if r.get("slug")}
     except Exception as exc:
         log.error(f"Unable to fetch models catalog: {exc}")
