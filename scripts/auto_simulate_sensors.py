@@ -133,13 +133,31 @@ def _resolve_catalog() -> dict[str, dict]:
 
 
 def _active_runs() -> set[str]:
-    """run_id of every run whose experiment is 'running' and has no end_time,
-    for the configured project."""
+    """run_id of every run whose experiment is 'running', still within its
+    planned end_time (if any — e.g. duration/duration_unit set from
+    FermOps), and has no end_time of its own, for the configured project.
+
+    Without the end_time check, this kept generating sensor data forever
+    for experiments that had already reached the end of their planned
+    duration — the DAG's own re-trigger loop correctly stops predicting at
+    that point, but the simulator had nothing telling it to stop too."""
+    now = datetime.now(timezone.utc)
     experiments = _get_all("/api/v1/experiments/")
-    running_exp_ids = {
-        e["id"] for e in experiments
-        if e.get("status") == "running" and e.get("project_id") == PROJECT_ID
-    }
+    running_exp_ids = set()
+    for e in experiments:
+        if e.get("status") != "running" or e.get("project_id") != PROJECT_ID:
+            continue
+        end_time = e.get("end_time")
+        if end_time:
+            try:
+                exp_end = datetime.fromisoformat(str(end_time).replace("Z", "+00:00"))
+                if exp_end.tzinfo is None:
+                    exp_end = exp_end.replace(tzinfo=timezone.utc)
+                if now > exp_end:
+                    continue  # planned duration is over
+            except ValueError:
+                pass
+        running_exp_ids.add(e["id"])
     if not running_exp_ids:
         return set()
 
