@@ -81,7 +81,9 @@ for the same `run_id` (with `last_processed_time` advanced to this cycle's
 snapshot) and repeats — so an experiment created for e.g. 2 hours keeps
 producing predictions for the full 2 hours, not just once. The chain stops
 itself once `experiments.end_time` passes; you only need to trigger it the
-one time, right after the run is created.
+one time, right after the run is created. When it stops, it also flips
+`experiments.status` to `completed` — needs `experiments:edit` on the
+service account, see model-registry/docs/AIRFLOW_INTEGRATION.md section 5.3.
 
 Each attached model can have its own sampling cadence
 (`models.input_time_interval`) — the DAG uses the **shortest** one across

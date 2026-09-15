@@ -83,6 +83,11 @@ def post(path: str, json_body: Optional[Dict[str, Any]] = None) -> requests.Resp
     return requests.post(_url(path), headers=headers, json=json_body, timeout=TIMEOUT, verify=VERIFY_TLS)
 
 
+def patch(path: str, json_body: Optional[Dict[str, Any]] = None) -> requests.Response:
+    headers = {"Content-Type": "application/json", **auth_headers()}
+    return requests.patch(_url(path), headers=headers, json=json_body, timeout=TIMEOUT, verify=VERIFY_TLS)
+
+
 def get_all_pages(path: str, params: Optional[Dict[str, Any]] = None, page_size: int = 1000) -> List[Dict[str, Any]]:
     """Page through a CRUD list endpoint (offset/limit only, no server-side filtering)."""
     out: List[Dict[str, Any]] = []

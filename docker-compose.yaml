@@ -57,6 +57,7 @@ x-airflow-common: &airflow-common
     - ./plugins:/opt/airflow/plugins
     - ./init:/opt/airflow/init
     - ./.env:/opt/airflow/.env:ro
+    - ./scripts:/opt/airflow/scripts:ro
 
   # Attach all Airflow core services to:
   # - airflow_internal: internal network for Postgres / Redis / Flower
@@ -230,6 +231,30 @@ services:
       airflow-metadata-db:
         condition: service_healthy
       redis:
+        condition: service_healthy
+
+  # --------------------------- Sensor data simulator ------------------
+  # Stand-in for real bioreactor hardware — generates sensor_readings /
+  # actuator_states for every "running" experiment via the Model Registry
+  # API. Previously had to be launched by hand; now starts with the stack
+  # and restarts itself if it crashes (restart: unless-stopped, inherited
+  # from x-airflow-common).
+  sensor-simulator:
+    <<: *airflow-common
+    command: ["python", "/opt/airflow/scripts/auto_simulate_sensors.py"]
+    environment:
+      <<: *airflow-common-env
+      PYTHONUNBUFFERED: "1"
+    # airflow_internal is only here because the base image's entrypoint
+    # does its own "airflow db check" against airflow-metadata-db before
+    # handing off to any command, regardless of what that command actually
+    # is — the script itself never talks to Airflow's own DB or Redis.
+    networks:
+      - airflow_internal
+      - stamm_net
+      - ml_net
+    depends_on:
+      airflow-metadata-db:
         condition: service_healthy
 
   # # --------------------------- Airflow REST API ----------------------

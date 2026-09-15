@@ -118,6 +118,19 @@ def _experiment_end_time(experiment_id: str) -> Optional[datetime]:
         return None
 
 
+def _mark_experiment_completed(experiment_id: str) -> None:
+    """Flip experiments.status to 'completed' once we've decided to stop
+    predicting for it (end_time has passed). Best-effort: never raises — a
+    failure here shouldn't affect the DAG's own control flow, which has
+    already stopped correctly regardless of whether this write succeeds."""
+    resp = registry_client.patch(f"/api/v1/experiments/{experiment_id}", {"status": "completed"})
+    if resp.status_code != 200:
+        log.warning(
+            f"could not mark experiment {experiment_id} as completed: "
+            f"HTTP {resp.status_code} {resp.text}"
+        )
+
+
 def _min_freshness_seconds(model_ids: List[str], catalog: Dict[str, dict]) -> int:
     """How old a reading is allowed to be, derived from the SHORTEST declared
     input_time_interval across every model attached to this run — with
@@ -206,6 +219,7 @@ def wait_for_new_data() -> bool:
     if experiment_id:
         end_time = _experiment_end_time(experiment_id)
         if end_time and datetime.now(timezone.utc) > end_time:
+            _mark_experiment_completed(experiment_id)
             raise AirflowSkipException(
                 f"[{run_id}] experiment {experiment_id} ended at {end_time.isoformat()} "
                 f"— no longer waiting for data."
@@ -531,6 +545,7 @@ def trigger_next_cycle() -> None:
         end_time = _experiment_end_time(experiment_id)
         if end_time and datetime.now(timezone.utc) > end_time:
             log.info(f"[{run_id}] experiment {experiment_id} ended at {end_time.isoformat()} — not re-triggering.")
+            _mark_experiment_completed(experiment_id)
             return
 
     token = _airflow_self_token()
