@@ -109,33 +109,55 @@ def _get_all(path: str) -> list[dict]:
     return out
 
 
-def _resolve_catalog() -> dict[str, dict]:
-    """variable -> {kind, id}. Exits with a clear message if any variable's
-    sensor/actuator row doesn't exist yet — this script never creates catalog
-    rows itself, that's a one-time setup step (see docs/AIRFLOW_INTEGRATION.md)."""
-    sensors = {s["variable"]: s["id"] for s in _get_all("/api/v1/sensors/") if s.get("variable")}
-    actuators = {a["variable"]: a["id"] for a in _get_all("/api/v1/actuators/") if a.get("variable")}
+def _resolve_catalog_by_bioreactor() -> dict[str, dict[str, dict]]:
+    """equipment_id (bioreactor) -> {variable -> {kind, id}}.
 
-    catalog, missing = {}, []
-    for var, meta in VARIABLES.items():
-        table = sensors if meta["kind"] == "sensor" else actuators
-        if var not in table:
-            missing.append(f"{var} ({meta['kind']})")
-        else:
-            catalog[var] = {"kind": meta["kind"], "id": table[var]}
+    Built from equipment_components — the sensors/actuators actually
+    registered to each bioreactor — instead of a single global "the"
+    sensor per variable name. Two runs on two different bioreactors get
+    two different sensor_ids for e.g. "temperature", exactly like real
+    hardware would have two separate probes."""
+    sensors = {s["id"]: s for s in _get_all("/api/v1/sensors/")}
+    actuators = {a["id"]: a for a in _get_all("/api/v1/actuators/")}
+    components = _get_all("/api/v1/equipment_components/")
 
+    by_equipment: dict[str, dict[str, dict]] = {}
+    for c in components:
+        eq_id = c.get("equipment_id")
+        if not eq_id:
+            continue
+        bucket = by_equipment.setdefault(eq_id, {})
+        sensor = sensors.get(c.get("sensor_id"))
+        if sensor and sensor.get("variable"):
+            bucket[sensor["variable"]] = {"kind": "sensor", "id": sensor["id"]}
+        actuator = actuators.get(c.get("actuator_id"))
+        if actuator and actuator.get("variable"):
+            bucket[actuator["variable"]] = {"kind": "actuator", "id": actuator["id"]}
+    return by_equipment
+
+
+def _catalog_for_vessel(by_equipment: dict[str, dict[str, dict]], vessel_id: str | None) -> dict[str, dict] | None:
+    """The subset of VARIABLES this specific bioreactor actually has
+    registered, or None (with a warning) if any are missing — never
+    invents a sensor/actuator that isn't really assigned to this vessel."""
+    if not vessel_id:
+        print("  no vessel_id set on this experiment — can't resolve its sensors, skipping.", file=sys.stderr)
+        return None
+    available = by_equipment.get(vessel_id, {})
+    missing = [f"{var} ({meta['kind']})" for var, meta in VARIABLES.items() if var not in available]
     if missing:
-        print("Missing sensor/actuator catalog rows, create them once first:", file=sys.stderr)
+        print(f"  bioreactor {vessel_id} is missing catalog rows in equipment_components, skipping:", file=sys.stderr)
         for m in missing:
-            print(f"  - {m}", file=sys.stderr)
-        sys.exit(1)
-    return catalog
+            print(f"    - {m}", file=sys.stderr)
+        return None
+    return {var: available[var] for var in VARIABLES}
 
 
-def _active_runs() -> set[str]:
-    """run_id of every run whose experiment is 'running', still within its
-    planned end_time (if any — e.g. duration/duration_unit set from
-    FermOps), and has no end_time of its own, for the configured project.
+def _active_runs() -> dict[str, str | None]:
+    """run_id -> vessel_id (the bioreactor its experiment runs on) for every
+    run whose experiment is 'running', still within its planned end_time (if
+    any — e.g. duration/duration_unit set from FermOps), and has no end_time
+    of its own, for the configured project.
 
     Without the end_time check, this kept generating sensor data forever
     for experiments that had already reached the end of their planned
@@ -143,7 +165,7 @@ def _active_runs() -> set[str]:
     that point, but the simulator had nothing telling it to stop too."""
     now = datetime.now(timezone.utc)
     experiments = _get_all("/api/v1/experiments/")
-    running_exp_ids = set()
+    running_exp_vessel: dict[str, str | None] = {}
     for e in experiments:
         if e.get("status") != "running" or e.get("project_id") != PROJECT_ID:
             continue
@@ -157,14 +179,15 @@ def _active_runs() -> set[str]:
                     continue  # planned duration is over
             except ValueError:
                 pass
-        running_exp_ids.add(e["id"])
-    if not running_exp_ids:
-        return set()
+        running_exp_vessel[e["id"]] = e.get("vessel_id")
+    if not running_exp_vessel:
+        return {}
 
     runs = _get_all("/api/v1/runs/")
     return {
-        r["id"] for r in runs
-        if r.get("experiment_id") in running_exp_ids and not r.get("end_time")
+        r["id"]: running_exp_vessel[r["experiment_id"]]
+        for r in runs
+        if r.get("experiment_id") in running_exp_vessel and not r.get("end_time")
     }
 
 
@@ -199,25 +222,38 @@ def main() -> None:
 
     print(f"Logging in as {EMAIL} @ {API_BASE} ...")
     _login()
-    catalog = _resolve_catalog()
     print(f"Watching project={PROJECT_ID} every {INTERVAL}s. Ctrl+C to stop.")
 
     states: dict[str, dict[str, float]] = {}
+    catalogs: dict[str, dict] = {}
 
     while _running:
         try:
-            active = _active_runs()
+            active = _active_runs()  # run_id -> vessel_id
+            active_ids = active.keys()
 
-            for run_id in active - states.keys():
-                print(f"[+] new active run {run_id} — starting simulated data")
+            # Re-resolved every tick (cheap, paginated API calls) so a
+            # bioreactor that gets its equipment_components links added
+            # (or a new run on it) is picked up without restarting this
+            # service — matters for runs that show up mid-tick.
+            by_equipment = _resolve_catalog_by_bioreactor()
+
+            for run_id in active_ids - states.keys():
+                vessel_id = active[run_id]
+                catalog = _catalog_for_vessel(by_equipment, vessel_id)
+                if catalog is None:
+                    continue  # retry next tick once the vessel's catalog is complete
+                print(f"[+] new active run {run_id} (vessel {vessel_id}) — starting simulated data")
+                catalogs[run_id] = catalog
                 states[run_id] = {v: (m["lo"] + m["hi"]) / 2 for v, m in VARIABLES.items()}
 
-            for run_id in states.keys() - active:
+            for run_id in states.keys() - active_ids:
                 print(f"[-] run {run_id} no longer active — stopping")
-            states = {rid: st for rid, st in states.items() if rid in active}
+            states = {rid: st for rid, st in states.items() if rid in active_ids}
+            catalogs = {rid: c for rid, c in catalogs.items() if rid in states}
 
             for run_id, state in states.items():
-                _write_tick(run_id, catalog, state)
+                _write_tick(run_id, catalogs[run_id], state)
 
             if states:
                 print(f"tick: {len(states)} active run(s)")
