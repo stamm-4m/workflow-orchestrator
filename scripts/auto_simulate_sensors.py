@@ -48,16 +48,36 @@ INTERVAL = float(os.getenv("SIM_INTERVAL_SECONDS", "20"))
 
 # The 8 variables the IndPenSim (penicillin) models expect — same set as
 # scripts/simulate_sensors.py. kind picks which catalog/table to use.
+#
+# start/end are fractions of [lo, hi] (0 = lo, 1 = hi) — roughly where a real
+# penicillin batch begins and ends on that signal, so values trend across the
+# run instead of hovering near one fixed point:
+#   - DO drops as growing biomass consumes oxygen
+#   - CO2 in off-gas rises with metabolic activity, O2 in off-gas falls
+#   - vessel_volume climbs as feed/base is added
+#   - agitator/sugar_feed_rate ramp up over the batch (cascade control, feed profile)
+#   - temperature/pH stay close to their setpoint, just a mild drift
 VARIABLES = {
-    "temperature": dict(kind="sensor", unit="K", lo=298, hi=308),
-    "pH": dict(kind="sensor", unit="pH", lo=5.5, hi=7.5),
-    "dissolved_oxygen_concentration": dict(kind="sensor", unit="mg/L", lo=0, hi=10),
-    "CO2_percent_in_off_gas": dict(kind="sensor", unit="%", lo=0, hi=10),
-    "oxygen_in_percent_in_off_gas": dict(kind="sensor", unit="%", lo=10, hi=21),
-    "vessel_volume": dict(kind="sensor", unit="L", lo=50, hi=150),
-    "agitator": dict(kind="actuator", unit="rpm", lo=100, hi=1200),
-    "sugar_feed_rate": dict(kind="actuator", unit="L/h", lo=0, hi=2),
+    "temperature":                    dict(kind="sensor",   unit="K",    lo=298, hi=308, start=0.55, end=0.60),
+    "pH":                             dict(kind="sensor",   unit="pH",   lo=5.5, hi=7.5,  start=0.65, end=0.40),
+    "dissolved_oxygen_concentration": dict(kind="sensor",   unit="mg/L", lo=0,   hi=10,   start=0.85, end=0.25),
+    "CO2_percent_in_off_gas":         dict(kind="sensor",   unit="%",    lo=0,   hi=10,   start=0.10, end=0.65),
+    "oxygen_in_percent_in_off_gas":   dict(kind="sensor",   unit="%",    lo=10,  hi=21,   start=0.85, end=0.45),
+    "vessel_volume":                  dict(kind="sensor",   unit="L",    lo=50,  hi=150,  start=0.30, end=0.85),
+    "agitator":                       dict(kind="actuator", unit="rpm",  lo=100, hi=1200, start=0.25, end=0.75),
+    "sugar_feed_rate":                dict(kind="actuator", unit="L/h",  lo=0,   hi=2,    start=0.10, end=0.70),
 }
+
+# Hours for each variable to travel its full start->end trajectory; holds at
+# the end value (plus noise) after that. Override for shorter/longer test runs.
+TRAJECTORY_HOURS = float(os.getenv("SIM_TRAJECTORY_HOURS", "3"))
+
+
+def _smoothstep(t: float) -> float:
+    """0..1 -> 0..1 S-curve (slow start/end, faster middle) — avoids a sharp
+    kink at t=0 that a plain linear ramp would have right when a run starts."""
+    t = min(1.0, max(0.0, t))
+    return t * t * (3 - 2 * t)
 
 _running = True
 _token_cache = {"access_token": None, "expires_at": 0.0}
@@ -191,13 +211,18 @@ def _active_runs() -> dict[str, str | None]:
     }
 
 
-def _write_tick(run_id: str, catalog: dict, state: dict[str, float]) -> None:
+def _write_tick(run_id: str, catalog: dict, elapsed_hours: float) -> None:
+    """Writes one reading per variable, following each one's start->end
+    trajectory (see VARIABLES) for how far into TRAJECTORY_HOURS this run
+    is, plus a bit of sensor noise (±3% of span) around that target."""
     now = datetime.now(timezone.utc).isoformat()
+    progress = _smoothstep(elapsed_hours / TRAJECTORY_HOURS) if TRAJECTORY_HOURS > 0 else 1.0
     for var, meta in VARIABLES.items():
         span = meta["hi"] - meta["lo"]
-        step = random.uniform(-0.03, 0.03) * span
-        value = min(meta["hi"], max(meta["lo"], state[var] + step))
-        state[var] = value
+        target_frac = meta["start"] + (meta["end"] - meta["start"]) * progress
+        target = meta["lo"] + target_frac * span
+        noise = random.uniform(-0.03, 0.03) * span
+        value = min(meta["hi"], max(meta["lo"], target + noise))
 
         entry = catalog[var]
         table = "sensor_readings" if entry["kind"] == "sensor" else "actuator_states"
@@ -224,7 +249,7 @@ def main() -> None:
     _login()
     print(f"Watching project={PROJECT_ID} every {INTERVAL}s. Ctrl+C to stop.")
 
-    states: dict[str, dict[str, float]] = {}
+    started_at: dict[str, float] = {}
     catalogs: dict[str, dict] = {}
 
     while _running:
@@ -238,25 +263,26 @@ def main() -> None:
             # service — matters for runs that show up mid-tick.
             by_equipment = _resolve_catalog_by_bioreactor()
 
-            for run_id in active_ids - states.keys():
+            for run_id in active_ids - started_at.keys():
                 vessel_id = active[run_id]
                 catalog = _catalog_for_vessel(by_equipment, vessel_id)
                 if catalog is None:
                     continue  # retry next tick once the vessel's catalog is complete
                 print(f"[+] new active run {run_id} (vessel {vessel_id}) — starting simulated data")
                 catalogs[run_id] = catalog
-                states[run_id] = {v: (m["lo"] + m["hi"]) / 2 for v, m in VARIABLES.items()}
+                started_at[run_id] = time.time()
 
-            for run_id in states.keys() - active_ids:
+            for run_id in started_at.keys() - active_ids:
                 print(f"[-] run {run_id} no longer active — stopping")
-            states = {rid: st for rid, st in states.items() if rid in active_ids}
-            catalogs = {rid: c for rid, c in catalogs.items() if rid in states}
+            started_at = {rid: t0 for rid, t0 in started_at.items() if rid in active_ids}
+            catalogs = {rid: c for rid, c in catalogs.items() if rid in started_at}
 
-            for run_id, state in states.items():
-                _write_tick(run_id, catalogs[run_id], state)
+            for run_id, t0 in started_at.items():
+                elapsed_hours = (time.time() - t0) / 3600.0
+                _write_tick(run_id, catalogs[run_id], elapsed_hours)
 
-            if states:
-                print(f"tick: {len(states)} active run(s)")
+            if started_at:
+                print(f"tick: {len(started_at)} active run(s)")
         except Exception as exc:
             print(f"poll failed: {exc}", file=sys.stderr)
 
